@@ -192,24 +192,25 @@ string mcp_serialize_dict(dictionary &in d)
             }
         }
 
-        // 4. Bool
-        if (!found)
-        {
-            bool bv;
-            if (d.get(k, bv))
-            {
-                val_str = bv ? "true" : "false";
-                found = true;
-            }
-        }
-
-        // 5. array<string> (value type)
+        // 4. array<string> — must come BEFORE bool: non-null object handles coerce to bool=true
+        //    in AngelScript's dictionary, so checking bool first would eat every array<string>.
         if (!found)
         {
             array<string> sa;
             if (d.get(k, sa))
             {
                 val_str = mcp_serialize_str_arr(sa);
+                found = true;
+            }
+        }
+
+        // 5. Bool
+        if (!found)
+        {
+            bool bv;
+            if (d.get(k, bv))
+            {
+                val_str = bv ? "true" : "false";
                 found = true;
             }
         }
@@ -713,15 +714,21 @@ void cmd_pattern_scan_all(dictionary &in req, dictionary &inout res)
     get_scan_region(req, start, size);
     if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
+    uint max_results = uint(get_dict_double(req, "max_results", 500));
+    if (max_results == 0 || max_results > 5000) max_results = 500;
+
     array<uint64> results;
     g_proc.find_all_code_patterns(start, size, sig, results);
 
     array<string> hex_results;
-    for (uint i = 0; i < results.length(); i++)
+    uint limit = results.length() < max_results ? results.length() : max_results;
+    for (uint i = 0; i < limit; i++)
         hex_results.insertLast(to_hex(results[i]));
 
     res.set("matches", hex_results);
     res.set("count", double(results.length()));
+    if (results.length() > max_results)
+        res.set("truncated", true);
 }
 
 // ─── Module Info ─────────────────────────────────────────────────────
@@ -839,7 +846,13 @@ void cmd_virtual_query(dictionary &in req, dictionary &inout res)
 void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
-    bool heap_only = get_dict_bool(req, "heap_only");
+    bool   heap_only  = get_dict_bool(req, "heap_only");
+    bool   compact    = get_dict_bool(req, "compact");          // return just {start,size} — no metadata
+    uint64 min_size   = uint64(get_dict_double(req, "min_size", 0));
+    uint64 addr_start = parse_hex(get_dict_string(req, "addr_start", "0x0"));
+    uint64 addr_end   = parse_hex(get_dict_string(req, "addr_end",   "0x0")); // 0 = no upper limit
+    bool   filter_addr = (addr_end != 0);
+
     array<dictionary@>@ vads = g_proc.get_vad_snapshot(heap_only);
     if (vads is null) { res.set("error", "VAD snapshot failed"); return; }
 
@@ -847,18 +860,28 @@ void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
     for (uint i = 0; i < vads.length(); i++)
     {
         if (vads[i] is null) continue;
-        dictionary entry;
-        int64 start, sz, end, prot, heap;
+        int64 start, sz, end_v, prot, heap;
         vads[i].get("start", start);
         vads[i].get("size", sz);
-        vads[i].get("end", end);
+        vads[i].get("end", end_v);
         vads[i].get("protection", prot);
         vads[i].get("heap_likely", heap);
-        entry.set("start", to_hex(uint64(start)));
-        entry.set("size", to_hex(uint64(sz)));
-        entry.set("end", to_hex(uint64(end)));
-        entry.set("protection", double(prot));
-        entry.set("heap_likely", heap != 0);
+
+        uint64 u_start = uint64(start);
+        uint64 u_size  = uint64(sz);
+
+        if (min_size > 0 && u_size < min_size) continue;
+        if (filter_addr && (u_start + u_size <= addr_start || u_start >= addr_end)) continue;
+
+        dictionary entry;
+        entry.set("start", to_hex(u_start));
+        entry.set("size",  to_hex(u_size));
+        if (!compact)
+        {
+            entry.set("end",        to_hex(uint64(end_v)));
+            entry.set("protection", double(prot));
+            entry.set("heap_likely", heap != 0);
+        }
         output.insertLast(@entry);
     }
     res.set("regions", @output);
@@ -952,15 +975,23 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
 
     if (results is null) { res.set("error", "scan returned null"); return; }
 
+    uint page_offset = uint(get_dict_double(req, "page_offset", 0));
+    uint page_limit  = uint(get_dict_double(req, "page_limit",  1000));
+    if (page_limit == 0 || page_limit > 5000) page_limit = 1000;
+
     array<string> hex_results;
-    uint limit = results.length() < 1000 ? results.length() : 1000;
-    for (uint i = 0; i < limit; i++)
+    uint from = page_offset < results.length() ? page_offset : results.length();
+    uint to   = from + page_limit;
+    if (to > results.length()) to = results.length();
+    for (uint i = from; i < to; i++)
         hex_results.insertLast(to_hex(results[i]));
 
     res.set("addresses", hex_results);
-    res.set("count", double(results.length()));
-    if (results.length() > 1000)
-        res.set("truncated", true);
+    res.set("count",      double(results.length()));
+    res.set("page_offset", double(from));
+    res.set("page_limit",  double(page_limit));
+    if (to < results.length())
+        res.set("has_more", true);
 }
 
 // ─── Advanced RE: Cross-references ───────────────────────────────────
@@ -1458,19 +1489,28 @@ void cmd_diff_memory(dictionary &in req, dictionary &inout res)
 void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
-    uint64 target = parse_hex(get_dict_string(req, "target"));
-    bool heap_only = get_dict_bool(req, "heap_only");
+    uint64 target    = parse_hex(get_dict_string(req, "target"));
+    bool   heap_only = get_dict_bool(req, "heap_only");
+    uint   page_offset = uint(get_dict_double(req, "page_offset", 0));
+    uint   page_limit  = uint(get_dict_double(req, "page_limit",  1000));
+    if (page_limit == 0 || page_limit > 5000) page_limit = 1000;
 
     array<uint64>@ results = g_proc.scan_pointer(target, heap_only);
     if (results is null) { res.set("error", "scan failed"); return; }
 
     array<string> hex_results;
-    uint limit = results.length() < 1000 ? results.length() : 1000;
-    for (uint i = 0; i < limit; i++)
+    uint from = page_offset < results.length() ? page_offset : results.length();
+    uint to   = from + page_limit;
+    if (to > results.length()) to = results.length();
+    for (uint i = from; i < to; i++)
         hex_results.insertLast(to_hex(results[i]));
 
-    res.set("addresses", hex_results);
-    res.set("count", double(results.length()));
+    res.set("addresses",   hex_results);
+    res.set("count",       double(results.length()));
+    res.set("page_offset", double(from));
+    res.set("page_limit",  double(page_limit));
+    if (to < results.length())
+        res.set("has_more", true);
 }
 
 // ─── String References ──────────────────────────────────────────────
@@ -1761,6 +1801,138 @@ void cmd_cs2_schema_dump(dictionary &inout res)
     res.set("count", double(output.length()));
 }
 
+// ─── Scan Heap Regions ───────────────────────────────────────────────
+// Scans a caller-supplied list of regions for a value via manual rvm reads.
+// Workaround for scan_value/scan_pointer_to not supporting per-region scans.
+// regions_csv: "0xSTART:0xSIZE,0xSTART:0xSIZE,..." (build from get_vad_snapshot output)
+// type: u32 | u64 | pointer    value: hex string for u64/pointer, number for u32
+
+void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
+{
+    if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
+
+    string regions_csv  = get_dict_string(req, "regions_csv");
+    string type         = get_dict_string(req, "type", "u64");
+    uint   max_results  = uint(get_dict_double(req, "max_results", 100));
+    if (max_results == 0 || max_results > 5000) max_results = 100;
+
+    if (regions_csv == "") { res.set("error", "missing regions_csv"); return; }
+
+    bool   is_u64 = (type == "u64" || type == "pointer");
+    bool   is_u32 = (type == "u32");
+    if (!is_u64 && !is_u32) { res.set("error", "type must be u32/u64/pointer"); return; }
+
+    uint   val_size = is_u64 ? 8 : 4;
+    uint64 u64_val  = 0;
+    uint   u32_val  = 0;
+    if (is_u64)
+    {
+        u64_val = parse_hex(get_dict_string(req, "value"));
+    }
+    else
+    {
+        double dv; req.get("value", dv);
+        u32_val = uint(dv);
+    }
+
+    array<string> region_pairs = str_split(regions_csv, ",");
+    array<string> found;
+    uint total_regions = 0;
+    uint64 total_bytes = 0;
+
+    for (uint ri = 0; ri < region_pairs.length() && found.length() < max_results; ri++)
+    {
+        array<string> parts = str_split(region_pairs[ri], ":");
+        if (parts.length() < 2) continue;
+        uint64 r_start = parse_hex(parts[0]);
+        uint64 r_size  = parse_hex(parts[1]);
+        if (r_start == 0 || r_size == 0 || r_size > 64 * 1024 * 1024) continue;
+
+        // Read the region (cap per-region read at 16 MB to avoid stalls)
+        uint read_sz = uint(r_size < 16 * 1024 * 1024 ? r_size : 16 * 1024 * 1024);
+        array<uint8> data;
+        g_proc.rvm(r_start, read_sz, data);
+        if (data.length() < val_size) continue;
+        total_regions++;
+        total_bytes += data.length();
+
+        // Scan aligned at val_size steps — enough for vtable/pointer/u64 scans
+        uint scan_end = data.length() - (val_size - 1);
+        for (uint i = 0; i < scan_end && found.length() < max_results; i += val_size)
+        {
+            if (is_u64)
+            {
+                uint64 v =  uint64(data[i])
+                         | (uint64(data[i+1]) << 8)
+                         | (uint64(data[i+2]) << 16)
+                         | (uint64(data[i+3]) << 24)
+                         | (uint64(data[i+4]) << 32)
+                         | (uint64(data[i+5]) << 40)
+                         | (uint64(data[i+6]) << 48)
+                         | (uint64(data[i+7]) << 56);
+                if (v == u64_val)
+                    found.insertLast(to_hex(r_start + i));
+            }
+            else
+            {
+                uint v =  uint(data[i])
+                       | (uint(data[i+1]) << 8)
+                       | (uint(data[i+2]) << 16)
+                       | (uint(data[i+3]) << 24);
+                if (v == u32_val)
+                    found.insertLast(to_hex(r_start + i));
+            }
+        }
+    }
+
+    res.set("addresses",       found);
+    res.set("count",           double(found.length()));
+    res.set("regions_scanned", double(total_regions));
+    res.set("bytes_scanned",   double(total_bytes));
+    if (found.length() >= max_results)
+        res.set("truncated", true);
+}
+
+// ─── Read And Filter Pointers ────────────────────────────────────────
+// Reads `count` pointers at base + i*stride, dereferences each at deref_offset,
+// and returns only entries where the dereferenced value equals vtable_check_addr.
+// Useful for filtering player arrays by vtable without N round-trip tool calls.
+
+void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
+{
+    if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
+
+    uint64 base         = parse_hex(get_dict_string(req, "base"));
+    uint   count        = uint(get_dict_double(req, "count", 64));
+    uint   stride       = uint(get_dict_double(req, "stride", 8));
+    uint64 vtable_check = parse_hex(get_dict_string(req, "vtable_check_addr"));
+    uint   deref_offset = uint(get_dict_double(req, "deref_offset", 0));
+
+    if (count == 0 || count > 2048) count = 64;
+    if (stride == 0) stride = 8;
+
+    array<dictionary@> matches;
+
+    for (uint i = 0; i < count; i++)
+    {
+        uint64 ptr_addr = base + uint64(i) * stride;
+        uint64 ptr      = g_proc.ru64(ptr_addr);
+        if (ptr == 0) continue;
+
+        uint64 check_val = g_proc.ru64(ptr + deref_offset);
+        if (check_val != vtable_check) continue;
+
+        dictionary m;
+        m.set("index",       double(i));
+        m.set("ptr_address", to_hex(ptr_addr));
+        m.set("pointer",     to_hex(ptr));
+        matches.insertLast(@m);
+    }
+
+    res.set("matches", @matches);
+    res.set("count",   double(matches.length()));
+}
+
 // ─── Request Router ──────────────────────────────────────────────────
 
 void handle_request(dictionary &in req)
@@ -1811,6 +1983,8 @@ void handle_request(dictionary &in req)
     else if (cmd == "dump_memory_region")  cmd_dump_memory_region(req, res);
     else if (cmd == "diff_memory")         cmd_diff_memory(req, res);
     else if (cmd == "scan_pointer_to")     cmd_scan_pointer_to(req, res);
+    else if (cmd == "scan_heap_regions")   cmd_scan_heap_regions(req, res);
+    else if (cmd == "read_and_filter_pointers") cmd_read_and_filter_pointers(req, res);
     else if (cmd == "find_string_refs")    cmd_find_string_refs(req, res);
     else if (cmd == "emulate_code")        cmd_emulate_code(req, res);
     else if (cmd == "assemble")            cmd_assemble(req, res);

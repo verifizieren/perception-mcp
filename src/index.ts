@@ -443,7 +443,8 @@ server.tool(
   { signature: z.string().describe("IDA-style pattern"),
     start: z.string().optional().describe("Start hex address"),
     size: z.string().optional().describe("Search region size in hex"),
-    module_name: z.string().optional().describe("Module to scan") },
+    module_name: z.string().optional().describe("Module to scan"),
+    max_results: z.number().optional().describe("Cap on matches returned (default 500, max 5000). count field always reflects the true total.") },
   async (params) => {
     const res = await callTool("pattern_scan_all", params, 60000);
     return { content: [{ type: "text", text: res }] };
@@ -512,10 +513,20 @@ server.tool(
 
 server.tool(
   "get_vad_snapshot",
-  "Get a snapshot of all Virtual Address Descriptor (VAD) entries in the process",
-  { heap_only: z.boolean().optional().describe("Only return heap-likely regions (default false)") },
+  "Get a snapshot of VAD (Virtual Address Descriptor) entries. Use filters to avoid the 210k+ character response that blows the result size limit.",
+  { heap_only:   z.boolean().optional().describe("Only return heap-likely regions (default false)"),
+    compact:     z.boolean().optional().describe("Return only {start, size} — omit protection/heap_likely metadata (default false)"),
+    min_size:    z.number().optional().describe("Skip regions smaller than this many bytes (e.g. 65536)"),
+    addr_start:  z.string().optional().describe("Only include regions that overlap this hex address range start"),
+    addr_end:    z.string().optional().describe("Only include regions that overlap this hex address range end") },
   async (params) => {
-    const res = await callTool("get_vad_snapshot", { heap_only: params.heap_only ?? false }, 60000);
+    const res = await callTool("get_vad_snapshot", {
+      heap_only:  params.heap_only  ?? false,
+      compact:    params.compact    ?? false,
+      min_size:   params.min_size   ?? 0,
+      addr_start: params.addr_start ?? "0x0",
+      addr_end:   params.addr_end   ?? "0x0",
+    }, 60000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -556,10 +567,12 @@ server.tool(
 
 server.tool(
   "scan_value",
-  "Scan entire process memory for a specific value. Returns array of addresses where value was found.",
+  "Scan entire process memory for a specific value. Returns array of addresses where value was found. Use page_offset/page_limit to paginate when count is large.",
   { type: z.enum(["u32","u64","float","double","string","wstring","pointer"]).describe("Value type to scan for"),
-    value: z.union([z.string(), z.number()]).describe("Value to search for"),
-    heap_only: z.boolean().optional().describe("Only scan heap regions (default false)") },
+    value: z.union([z.string(), z.number()]).describe("Value to search for (hex string for u64/pointer, number for u32/float/double)"),
+    heap_only:   z.boolean().optional().describe("Only scan heap regions (default false)"),
+    page_offset: z.number().optional().describe("Skip this many results before returning (default 0)"),
+    page_limit:  z.number().optional().describe("Max addresses to return (default 1000, max 5000)") },
   async (params) => {
     const res = await callTool("scan_value", params, 120000);
     return { content: [{ type: "text", text: res }] };
@@ -672,9 +685,11 @@ server.tool(
 
 server.tool(
   "scan_pointer_to",
-  "Scan for pointers pointing to a target address (useful for finding references to objects)",
+  "Scan for pointers pointing to a target address. Use page_offset/page_limit to paginate large result sets.",
   { target: z.string().describe("Target hex address"),
-    heap_only: z.boolean().optional().describe("Only scan heap regions (default false)") },
+    heap_only:   z.boolean().optional().describe("Only scan heap regions (default false)"),
+    page_offset: z.number().optional().describe("Skip this many results before returning (default 0)"),
+    page_limit:  z.number().optional().describe("Max addresses to return (default 1000, max 5000)") },
   async (params) => {
     const res = await callTool("scan_pointer_to", params, 120000);
     return { content: [{ type: "text", text: res }] };
@@ -743,6 +758,52 @@ server.tool(
     size: z.number().optional().describe("Number of bytes (default 256, max 4096)") },
   async (params) => {
     const res = await callTool("hex_dump", { address: params.address, size: params.size ?? 256 });
+    return { content: [{ type: "text", text: res }] };
+  }
+);
+
+// ── Targeted Heap Region Scan ─────────────────────────────────────────
+
+server.tool(
+  "scan_heap_regions",
+  "Scan a caller-supplied list of heap regions for a value via direct memory reads. More targeted than full-process scan_value. Build the region list from get_vad_snapshot with heap_only+compact+min_size filters.",
+  { regions: z.array(z.object({
+      start: z.string().describe("Hex start address of region"),
+      size:  z.string().describe("Hex size of region")
+    })).describe("Regions to scan — take from get_vad_snapshot output"),
+    type:        z.enum(["u32","u64","pointer"]).describe("Value type (u32=4-byte, u64/pointer=8-byte)"),
+    value:       z.union([z.string(), z.number()]).describe("Value to scan for (hex string for u64/pointer, number for u32)"),
+    max_results: z.number().optional().describe("Max addresses to return (default 100)") },
+  async (params) => {
+    const regionsCsv = params.regions.map(r => `${r.start}:${r.size}`).join(",");
+    const res = await callTool("scan_heap_regions", {
+      regions_csv: regionsCsv,
+      type:        params.type,
+      value:       params.value,
+      max_results: params.max_results ?? 100,
+    }, 120000);
+    return { content: [{ type: "text", text: res }] };
+  }
+);
+
+// ── Read & Filter Pointer Array ───────────────────────────────────────
+
+server.tool(
+  "read_and_filter_pointers",
+  "Read count pointers at base+i*stride, dereference each at deref_offset, and return only those where the dereferenced value equals vtable_check_addr. Replaces a manual loop of read_values + vtable checks.",
+  { base:             z.string().describe("Base hex address of the pointer array"),
+    count:            z.number().describe("Number of pointers to read"),
+    stride:           z.number().optional().describe("Stride between pointers in bytes (default 8)"),
+    vtable_check_addr: z.string().describe("Hex address that *ptr+deref_offset must equal"),
+    deref_offset:     z.number().optional().describe("Byte offset within the dereferenced object to read and compare (default 0 = vtable)") },
+  async (params) => {
+    const res = await callTool("read_and_filter_pointers", {
+      base:             params.base,
+      count:            params.count,
+      stride:           params.stride ?? 8,
+      vtable_check_addr: params.vtable_check_addr,
+      deref_offset:     params.deref_offset ?? 0,
+    });
     return { content: [{ type: "text", text: res }] };
   }
 );
