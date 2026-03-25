@@ -79,12 +79,23 @@ function startHub() {
           clientType = "perception";
           percClient = ws;
           console.error("[perception-mcp] Perception AngelScript client connected");
+
+          // Hub-side keepalive: send a text ping every 25s so the TCP idle timer
+          // on either side never fires. The AngelScript client silently drops it.
+          const hubPingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ _hub_ping: true }));
+            } else {
+              clearInterval(hubPingInterval);
+            }
+          }, 25000);
+          ws.on("close", () => clearInterval(hubPingInterval));
         }
 
         if (clientType === "perception") {
           // Response from Perception — route to correct requester
           const id: string = msg._id;
-          if (!id) return;
+          if (!id) return; // hub pings and keepalives arrive here — silently ignored
 
           // Check if it's for a relay client (id starts with relay's instanceId)
           let routed = false;

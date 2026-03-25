@@ -1999,9 +1999,28 @@ void handle_request(dictionary &in req)
 
 // ─── WebSocket Pump ──────────────────────────────────────────────────
 
+// Ticks since last outbound message — used to throttle keepalive pings
+int g_idle_ticks = 0;
+const int KEEPALIVE_INTERVAL = 30; // seconds (callback fires at ~1Hz)
+
+void do_disconnect(const string &in reason)
+{
+    log_console("[RE Server] " + reason + " — reconnecting...");
+    g_ws.close();
+    g_ws = ws_t();
+    g_connected = false;
+    g_idle_ticks = 0;
+    g_retry_count = 0;
+}
+
 void ws_pump()
 {
-    if (!g_ws.is_open()) return;
+    // Detect silent drops: socket closed without a clean WS close frame
+    if (!g_ws.is_open())
+    {
+        do_disconnect("Connection lost (silent drop)");
+        return;
+    }
 
     string msg;
     bool is_text = false;
@@ -2011,23 +2030,33 @@ void ws_pump()
     {
         if (is_text)
         {
+            // Swallow hub pings ({"_hub_ping":true}) — no response needed
+            if (msg.findFirst("_hub_ping") >= 0) { g_idle_ticks = 0; break; }
+
             dictionary req;
             string err;
             if (json_parse(msg, req, err))
                 handle_request(req);
             else
                 log_error("JSON parse error: " + err);
+            g_idle_ticks = 0;
         }
         if (is_closed) break;
     }
 
     if (is_closed)
     {
-        log_console("[RE Server] MCP disconnected, will retry in background...");
-        g_ws.close();
-        g_ws = ws_t();
-        g_connected = false;
-        g_retry_count = 0;
+        do_disconnect("MCP disconnected (clean close)");
+        return;
+    }
+
+    // Keepalive: send a no-op ping every KEEPALIVE_INTERVAL idle seconds.
+    // The hub ignores messages without _id, so this is a free heartbeat.
+    g_idle_ticks++;
+    if (g_idle_ticks >= KEEPALIVE_INTERVAL)
+    {
+        g_ws.send_text("{\"_ping\":true}");
+        g_idle_ticks = 0;
     }
 }
 
@@ -2037,8 +2066,9 @@ void try_connect()
     if (g_ws.is_open())
     {
         g_connected = true;
+        g_idle_ticks = 0;
         g_retry_count = 0;
-        log_console("[RE Server] Connected to MCP server. 35+ RE tools available.");
+        log_console("[RE Server] Connected to MCP server. RE tools available.");
     }
     else
     {
