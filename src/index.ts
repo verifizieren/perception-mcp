@@ -211,7 +211,7 @@ function startRelay() {
 }
 
 // ─── Send Command (works in both hub and relay mode) ─────────────────
-function sendCommand(cmd: string, params: Record<string, any> = {}, timeoutMs = 30000): Promise<any> {
+function sendCommand(cmd: string, params: Record<string, any> = {}, timeoutMs = 60000): Promise<any> {
   return new Promise((resolve, reject) => {
     // Hub mode: send directly to Perception
     if (isHub) {
@@ -244,7 +244,7 @@ function sendCommand(cmd: string, params: Record<string, any> = {}, timeoutMs = 
   });
 }
 
-async function callTool(cmd: string, params: Record<string, any> = {}, timeoutMs = 30000): Promise<string> {
+async function callTool(cmd: string, params: Record<string, any> = {}, timeoutMs = 60000): Promise<string> {
   const result = await sendCommand(cmd, params, timeoutMs);
   if (result.error) throw new Error(result.error);
   return JSON.stringify(result, null, 2);
@@ -457,7 +457,7 @@ server.tool(
     module_name: z.string().optional().describe("Module to scan"),
     max_results: z.number().optional().describe("Cap on matches returned (default 500, max 5000). count field always reflects the true total.") },
   async (params) => {
-    const res = await callTool("pattern_scan_all", params, 60000);
+    const res = await callTool("pattern_scan_all", params, 120000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -585,7 +585,7 @@ server.tool(
     page_offset: z.number().optional().describe("Skip this many results before returning (default 0)"),
     page_limit:  z.number().optional().describe("Max addresses to return (default 1000, max 5000)") },
   async (params) => {
-    const res = await callTool("scan_value", params, 120000);
+    const res = await callTool("scan_value", params, 180000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -600,7 +600,7 @@ server.tool(
     size: z.string().optional().describe("Search region size in hex"),
     module_name: z.string().optional().describe("Module to search in") },
   async (params) => {
-    const res = await callTool("find_xrefs", params, 60000);
+    const res = await callTool("find_xrefs", params, 120000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -614,7 +614,7 @@ server.tool(
     max_entries: z.number().optional().describe("Max entries to read (default 50)"),
     disasm_preview: z.boolean().optional().describe("Disassemble first few instructions of each entry (default false)") },
   async (params) => {
-    const res = await callTool("analyze_vtable", { address: params.address, max_entries: params.max_entries ?? 50, disasm_preview: params.disasm_preview ?? false }, 60000);
+    const res = await callTool("analyze_vtable", { address: params.address, max_entries: params.max_entries ?? 50, disasm_preview: params.disasm_preview ?? false }, 120000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -662,7 +662,7 @@ server.tool(
   { address: z.string().describe("Function start address"),
     max_size: z.number().optional().describe("Max bytes to analyze (default 4096)") },
   async (params) => {
-    const res = await callTool("analyze_function", { address: params.address, max_size: params.max_size ?? 4096 }, 60000);
+    const res = await callTool("analyze_function", { address: params.address, max_size: params.max_size ?? 4096 }, 120000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -702,7 +702,7 @@ server.tool(
     page_offset: z.number().optional().describe("Skip this many results before returning (default 0)"),
     page_limit:  z.number().optional().describe("Max addresses to return (default 1000, max 5000)") },
   async (params) => {
-    const res = await callTool("scan_pointer_to", params, 120000);
+    const res = await callTool("scan_pointer_to", params, 180000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -715,7 +715,7 @@ server.tool(
   { search_text: z.string().describe("Text to search for in strings"),
     module_name: z.string().optional().describe("Module to search (default: main)") },
   async (params) => {
-    const res = await callTool("find_string_refs", params, 60000);
+    const res = await callTool("find_string_refs", params, 120000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -837,7 +837,45 @@ server.tool(
   "Dump CS2 schema system (all classes and field offsets)",
   {},
   async () => {
-    const res = await callTool("cs2_schema_dump", {}, 60000);
+    const res = await callTool("cs2_schema_dump", {}, 120000);
+    return { content: [{ type: "text", text: res }] };
+  }
+);
+
+// ── Batch Commands ──────────────────────────────────────────────────
+
+server.tool(
+  "batch_commands",
+  "Execute multiple RE commands in a single round-trip. Much faster than individual calls. Each command is a {cmd, ...params} object. Returns all results in order.",
+  { commands: z.array(z.record(z.string(), z.any())).describe("Array of command objects, each with 'cmd' and its parameters. E.g. [{cmd:'read_values', address:'0x1000', type:'u64', count:1}, {cmd:'read_string', address:'0x2000'}]") },
+  async (params) => {
+    const res = await callTool("batch", { commands: params.commands }, 180000);
+    return { content: [{ type: "text", text: res }] };
+  }
+);
+
+// ── Composite RE Tools ──────────────────────────────────────────────
+
+server.tool(
+  "analyze_object",
+  "Deep-analyze an object pointer in one call: reads vtable, RTTI class name + base classes, vtable functions (with optional disasm), and classifies every field (pointer/float/int/null/string). Use follow_pointers+deref_depth to recursively explore sub-objects with RTTI. Replaces many individual read calls.",
+  { address: z.string().describe("Object pointer hex address"),
+    size: z.number().optional().describe("Bytes to analyze (default 256, max 8192)"),
+    vtable_max: z.number().optional().describe("Max vtable entries to read (default 16)"),
+    vtable_disasm: z.boolean().optional().describe("Disassemble first 5 instructions of each vtable entry (default false)"),
+    deref_depth: z.number().optional().describe("How many levels deep to follow pointer chains (default 1)"),
+    stride: z.number().optional().describe("Field alignment: 4 or 8 bytes (default 8)"),
+    read_strings: z.boolean().optional().describe("Try reading ANSI strings at pointer targets (default true)"),
+    read_wstrings: z.boolean().optional().describe("Try reading wide strings at pointer targets (default false)"),
+    string_max: z.number().optional().describe("Max string length to read (default 128)"),
+    skip_rtti: z.boolean().optional().describe("Skip RTTI reading (default false)"),
+    skip_vtable: z.boolean().optional().describe("Skip vtable reading (default false)"),
+    skip_fields: z.boolean().optional().describe("Skip field classification, only get vtable+RTTI (default false)"),
+    field_offset: z.number().optional().describe("Start field classification at this byte offset (default 0)"),
+    hex_dump: z.boolean().optional().describe("Include raw hex dump of the region (default false)"),
+    follow_pointers: z.boolean().optional().describe("Follow pointers to read chains and sub-object RTTI (default false)") },
+  async (params) => {
+    const res = await callTool("analyze_object", params, 120000);
     return { content: [{ type: "text", text: res }] };
   }
 );

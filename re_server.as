@@ -931,26 +931,26 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
     string type = get_dict_string(req, "type");
     bool heap_only = get_dict_bool(req, "heap_only");
 
+    // Value can arrive as double or string from JSON
+    double num_val = get_dict_double(req, "value", 0);
+    string str_val = get_dict_string(req, "value", "");
+
     array<uint64>@ results;
     if (type == "u32")
     {
-        double v; req.get("value", v);
-        @results = g_proc.scan_u32(uint(v), heap_only);
+        @results = g_proc.scan_u32(uint(num_val), heap_only);
     }
     else if (type == "u64")
     {
-        string v = get_dict_string(req, "value");
-        @results = g_proc.scan_u64(parse_hex(v), heap_only);
+        @results = g_proc.scan_u64(parse_hex(str_val), heap_only);
     }
     else if (type == "float")
     {
-        double v; req.get("value", v);
-        @results = g_proc.scan_float(float(v), heap_only);
+        @results = g_proc.scan_float(float(num_val), heap_only);
     }
     else if (type == "double")
     {
-        double v; req.get("value", v);
-        @results = g_proc.scan_double(v, heap_only);
+        @results = g_proc.scan_double(num_val, heap_only);
     }
     else if (type == "string")
     {
@@ -1600,13 +1600,16 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     }
     uc_mem_write(uc, map_addr, code);
 
-    // Setup stack
+    // Setup stack (uc_setup_stack maps stack + stop page internally)
     uint64 stack_base = 0x100000;
     uint64 stack_size = 0x10000;
     uint64 stop_addr = 0xDEAD0000;
-    uc_mem_map(uc, stack_base, stack_size, UC_PROT_ALL);
-    uc_mem_map(uc, stop_addr & ~0xFFF, 0x1000, UC_PROT_ALL);
-    uc_setup_stack(uc, stack_base, stack_size, stop_addr);
+    if (!uc_setup_stack(uc, stack_base, stack_size, stop_addr))
+    {
+        uc_close(uc);
+        res.set("error", "uc_setup_stack failed");
+        return;
+    }
 
     // Map additional regions if requested
     array<dictionary@>@ map_regions;
@@ -1666,14 +1669,11 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
 
     // Execute
     uint64 start_addr = map_addr + entry_offset;
-    int emu_result = uc_start(uc, start_addr, stop_addr, 0, max_insts);
+    bool emu_ok = uc_start(uc, start_addr, stop_addr, 0, max_insts) != 0;
 
-    res.set("emu_result", double(emu_result));
+    res.set("success", emu_ok);
 
     // Read output registers
-    array<string> read_regs;
-    array<dictionary@>@ read_regs_raw;
-    // Default: read rax
     dictionary reg_out;
     reg_out.set("rax", to_hex(uc_reg_read64(uc, UC_X86_REG_RAX)));
     reg_out.set("rbx", to_hex(uc_reg_read64(uc, UC_X86_REG_RBX)));
@@ -1686,9 +1686,11 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     reg_out.set("rip", to_hex(uc_reg_read64(uc, UC_X86_REG_RIP)));
     res.set("registers", @reg_out);
 
-    if (emu_result != 0)
+    // Always check exception state
+    int exc = uc_get_last_exception(uc);
+    if (exc != 0)
     {
-        res.set("exception", double(uc_get_last_exception(uc)));
+        res.set("exception", double(exc));
         res.set("exception_address", to_hex(uc_get_exception_address(uc)));
     }
 
@@ -1933,20 +1935,241 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
     res.set("count",   double(matches.length()));
 }
 
-// ─── Request Router ──────────────────────────────────────────────────
+// ─── Composite Tools ────────────────────────────────────────────────
 
-void handle_request(dictionary &in req)
+void cmd_analyze_object(dictionary &in req, dictionary &inout res)
 {
-    string cmd;
-    if (!req.get("cmd", cmd)) return;
+    if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
+    uint64 addr = parse_hex(get_dict_string(req, "address"));
+    uint dump_size = uint(get_dict_double(req, "size", 256));
+    if (dump_size > 8192) dump_size = 8192;
 
-    string req_id;
-    req.get("_id", req_id);
+    // Options
+    uint vtable_max       = uint(get_dict_double(req, "vtable_max", 16));
+    bool vtable_disasm    = get_dict_bool(req, "vtable_disasm");
+    uint deref_depth      = uint(get_dict_double(req, "deref_depth", 1));
+    uint field_stride     = uint(get_dict_double(req, "stride", 8));
+    if (field_stride != 4 && field_stride != 8) field_stride = 8;
+    bool read_strings     = get_dict_bool(req, "read_strings", true);
+    bool read_wstrings    = get_dict_bool(req, "read_wstrings");
+    uint string_max       = uint(get_dict_double(req, "string_max", 128));
+    bool skip_rtti        = get_dict_bool(req, "skip_rtti");
+    bool skip_vtable      = get_dict_bool(req, "skip_vtable");
+    bool skip_fields      = get_dict_bool(req, "skip_fields");
+    uint field_offset     = uint(get_dict_double(req, "field_offset", 0));
+    bool include_hex_dump = get_dict_bool(req, "hex_dump");
+    bool follow_pointers  = get_dict_bool(req, "follow_pointers");
 
-    dictionary res;
-    if (req_id != "")
-        res.set("_id", req_id);
+    // 1. Read vtable pointer
+    uint64 vtable_ptr = g_proc.ru64(addr);
+    res.set("vtable_ptr", to_hex(vtable_ptr));
 
+    // 2. RTTI
+    if (!skip_rtti && vtable_ptr > 0x10000 && g_proc.is_valid_address(vtable_ptr))
+    {
+        uint64 rtti_ptr = g_proc.ru64(vtable_ptr - 8);
+        if (rtti_ptr != 0 && g_proc.is_valid_address(rtti_ptr))
+        {
+            uint64 type_desc_ptr = g_proc.ru64(rtti_ptr + 16);
+            if (type_desc_ptr != 0 && g_proc.is_valid_address(type_desc_ptr))
+            {
+                string class_name = g_proc.rs(type_desc_ptr + 16, 256);
+                if (class_name.length() > 0)
+                    res.set("class_name", class_name);
+            }
+
+            // Read base class hierarchy
+            int32 num_base = g_proc.r32(rtti_ptr + 8);
+            uint64 base_arr_ptr = g_proc.ru64(rtti_ptr + 24);
+            if (num_base > 1 && num_base < 32 && base_arr_ptr != 0 && g_proc.is_valid_address(base_arr_ptr))
+            {
+                array<string> bases;
+                for (int b = 1; b < num_base; b++)
+                {
+                    uint64 base_desc = g_proc.ru64(base_arr_ptr + uint64(b) * 8);
+                    if (base_desc == 0 || !g_proc.is_valid_address(base_desc)) break;
+                    uint64 base_td = g_proc.ru64(base_desc);
+                    if (base_td != 0 && g_proc.is_valid_address(base_td))
+                    {
+                        string bn = g_proc.rs(base_td + 16, 256);
+                        if (bn.length() > 0) bases.insertLast(bn);
+                    }
+                }
+                if (bases.length() > 0)
+                    res.set("base_classes", bases);
+            }
+        }
+    }
+
+    // 3. Vtable entries
+    if (!skip_vtable && vtable_ptr > 0x10000 && g_proc.is_valid_address(vtable_ptr))
+    {
+        array<dictionary@> vtable_entries;
+        for (uint i = 0; i < vtable_max; i++)
+        {
+            uint64 fn = g_proc.ru64(vtable_ptr + uint64(i) * 8);
+            if (fn == 0 || !g_proc.is_valid_address(fn)) break;
+
+            dictionary vte;
+            vte.set("index", double(i));
+            vte.set("address", to_hex(fn));
+
+            if (vtable_disasm)
+            {
+                array<uint8> code;
+                g_proc.rvm(fn, 64, code);
+                if (code.length() > 0)
+                {
+                    array<dictionary@> insts;
+                    zydis_disasm(code, fn, insts);
+                    uint limit = insts.length() < 5 ? insts.length() : 5;
+                    array<string> lines;
+                    for (uint j = 0; j < limit; j++)
+                    {
+                        if (insts[j] is null) continue;
+                        string text;
+                        insts[j].get("text", text);
+                        lines.insertLast(text);
+                    }
+                    vte.set("disasm", lines);
+                }
+            }
+            vtable_entries.insertLast(@vte);
+        }
+        res.set("vtable", @vtable_entries);
+        res.set("vtable_count", double(vtable_entries.length()));
+    }
+
+    // 4. Optional hex dump
+    if (include_hex_dump)
+    {
+        array<uint8> raw;
+        g_proc.rvm(addr, dump_size, raw);
+        if (raw.length() > 0)
+            res.set("hex", bytes_to_hex(raw));
+    }
+
+    // 5. Classify fields
+    if (!skip_fields)
+    {
+        array<dictionary@> fields;
+        for (uint off = field_offset; off < dump_size; off += field_stride)
+        {
+            uint64 val = (field_stride == 8) ? g_proc.ru64(addr + off) : uint64(g_proc.ru32(addr + off));
+            dictionary field;
+            field.set("offset", to_hex(uint64(off)));
+            field.set("raw_hex", to_hex(val));
+
+            if (val == 0)
+            {
+                field.set("type", "null");
+            }
+            else if (val > 0x10000 && val < 0x7FFFFFFFFFFF && g_proc.is_valid_address(val))
+            {
+                uint64 deref = g_proc.ru64(val);
+                bool deref_valid = deref > 0x10000 && deref < 0x7FFFFFFFFFFF && g_proc.is_valid_address(deref);
+
+                if (deref_valid)
+                    field.set("type", "pointer");
+                else
+                    field.set("type", "pointer_leaf");
+
+                field.set("deref", to_hex(deref));
+
+                // String detection
+                if (read_strings)
+                {
+                    uint8 b0 = g_proc.ru8(val);
+                    if (b0 >= 0x20 && b0 < 0x7F)
+                    {
+                        string s = g_proc.rs(val, string_max);
+                        if (s.length() >= 2)
+                            field.set("as_string", s);
+                    }
+                }
+                if (read_wstrings)
+                {
+                    uint16 w0 = g_proc.ru16(val);
+                    if (w0 >= 0x20 && w0 < 0x7F00)
+                    {
+                        string ws_val = g_proc.rws(val, string_max);
+                        if (ws_val.length() >= 2)
+                            field.set("as_wstring", ws_val);
+                    }
+                }
+
+                // Follow pointers deeper
+                if (follow_pointers && deref_valid && deref_depth > 1)
+                {
+                    array<string> chain;
+                    chain.insertLast(to_hex(deref));
+                    uint64 curr = deref;
+                    for (uint d = 1; d < deref_depth; d++)
+                    {
+                        uint64 next = g_proc.ru64(curr);
+                        if (next == 0 || !g_proc.is_valid_address(next)) break;
+                        chain.insertLast(to_hex(next));
+                        curr = next;
+                    }
+                    if (chain.length() > 1)
+                        field.set("pointer_chain", chain);
+                }
+
+                // Try RTTI on sub-objects (if deref looks like a vtable)
+                if (follow_pointers && deref_valid)
+                {
+                    uint64 sub_vtable = g_proc.ru64(val);
+                    if (sub_vtable > 0x10000 && g_proc.is_valid_address(sub_vtable))
+                    {
+                        uint64 sub_rtti = g_proc.ru64(sub_vtable - 8);
+                        if (sub_rtti != 0 && g_proc.is_valid_address(sub_rtti))
+                        {
+                            uint64 sub_td = g_proc.ru64(sub_rtti + 16);
+                            if (sub_td != 0 && g_proc.is_valid_address(sub_td))
+                            {
+                                string cn = g_proc.rs(sub_td + 16, 128);
+                                if (cn.length() > 0)
+                                    field.set("rtti_name", cn);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                float f = g_proc.rf32(addr + off);
+                double d = g_proc.rf64(addr + off);
+                bool likely_float = (f > -1e10 && f < 1e10 && f != 0.0f && (f > 0.001f || f < -0.001f));
+                bool likely_double = (d > -1e15 && d < 1e15 && d != 0.0 && (d > 0.001 || d < -0.001));
+
+                if (likely_float)
+                {
+                    field.set("type", "float_or_int");
+                    field.set("as_float", double(f));
+                }
+                else if (likely_double)
+                {
+                    field.set("type", "double_or_int");
+                    field.set("as_double", d);
+                }
+                else
+                {
+                    field.set("type", "integer");
+                }
+                field.set("as_u32", double(uint(val & 0xFFFFFFFF)));
+                field.set("as_i32", double(int(val & 0xFFFFFFFF)));
+            }
+            fields.insertLast(@field);
+        }
+        res.set("fields", @fields);
+        res.set("field_count", double(fields.length()));
+    }
+}
+
+// ─── Batch Command Handler ──────────────────────────────────────────
+
+void dispatch_command(const string &in cmd, dictionary &in req, dictionary &inout res)
+{
     if      (cmd == "attach")              cmd_attach(req, res);
     else if (cmd == "detach")              cmd_detach(res);
     else if (cmd == "process_info")        cmd_process_info(res);
@@ -1991,8 +2214,51 @@ void handle_request(dictionary &in req)
     else if (cmd == "hex_dump")            cmd_hex_dump(req, res);
     else if (cmd == "cs2_get_interface")   cmd_cs2_get_interface(req, res);
     else if (cmd == "cs2_schema_dump")     cmd_cs2_schema_dump(res);
+    else if (cmd == "analyze_object")      cmd_analyze_object(req, res);
     else
         res.set("error", "unknown command: " + cmd);
+}
+
+void cmd_batch(dictionary &in req, dictionary &inout res)
+{
+    array<dictionary@>@ commands;
+    if (!req.get("commands", @commands) || commands is null)
+    {
+        res.set("error", "batch requires 'commands' array");
+        return;
+    }
+
+    array<dictionary@> results;
+    for (uint i = 0; i < commands.length(); i++)
+    {
+        if (commands[i] is null) continue;
+        string sub_cmd = get_dict_string(commands[i], "cmd");
+        dictionary sub_res;
+        dispatch_command(sub_cmd, commands[i], sub_res);
+        results.insertLast(@sub_res);
+    }
+    res.set("results", @results);
+    res.set("count", double(results.length()));
+}
+
+// ─── Request Router ──────────────────────────────────────────────────
+
+void handle_request(dictionary &in req)
+{
+    string cmd;
+    if (!req.get("cmd", cmd)) return;
+
+    string req_id;
+    req.get("_id", req_id);
+
+    dictionary res;
+    if (req_id != "")
+        res.set("_id", req_id);
+
+    if (cmd == "batch")
+        cmd_batch(req, res);
+    else
+        dispatch_command(cmd, req, res);
 
     send_response(res);
 }
