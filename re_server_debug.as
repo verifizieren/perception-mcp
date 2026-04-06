@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════
-// Perception RE Server - AngelScript WebSocket bridge for MCP
-// Handles all reverse engineering commands from the MCP server
+// Perception RE Server DEBUG - All operations logged to console
+// Drop-in replacement for re_server.as — verbose logging enabled
 // ═══════════════════════════════════════════════════════════════════════
 
 ws_t   g_ws;
@@ -19,6 +19,11 @@ const string HEX_CHARS = "0123456789abcdef";
 const string HEX_UPPER = "0123456789ABCDEF";
 const string ASCII_PRINTABLE = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
+void dbg(const string &in msg)
+{
+    log_console("[DBG] " + msg);
+}
+
 uint64 parse_hex(const string &in s)
 {
     string h = s;
@@ -29,9 +34,9 @@ uint64 parse_hex(const string &in s)
     {
         result <<= 4;
         uint8 c = h[i];
-        if (c >= 48 && c <= 57)       result |= (c - 48);       // 0-9
-        else if (c >= 65 && c <= 70)   result |= (c - 55);       // A-F
-        else if (c >= 97 && c <= 102)  result |= (c - 87);       // a-f
+        if (c >= 48 && c <= 57)       result |= (c - 48);
+        else if (c >= 65 && c <= 70)   result |= (c - 55);
+        else if (c >= 97 && c <= 102)  result |= (c - 87);
     }
     return result;
 }
@@ -50,7 +55,6 @@ string to_hex(uint64 v)
     return "0x" + result;
 }
 
-// Manual string split since .split() may not be registered
 array<string> str_split(const string &in s, const string &in delim)
 {
     array<string> parts;
@@ -78,7 +82,7 @@ string bytes_to_hex(const array<uint8> &in data)
     return util_hex_encode(raw);
 }
 
-// ─── JSON Serializer (handles nested arrays/dicts) ───────────────────
+// ─── JSON Serializer ─────────────────────────────────────────────────
 
 string mcp_json_escape(const string &in s)
 {
@@ -86,11 +90,11 @@ string mcp_json_escape(const string &in s)
     for (uint i = 0; i < s.length(); i++)
     {
         uint8 c = s[i];
-        if (c == 34) r += "\\\"";       // "
-        else if (c == 92) r += "\\\\";   // backslash
-        else if (c == 10) r += "\\n";    // newline
-        else if (c == 13) r += "\\r";    // carriage return
-        else if (c == 9) r += "\\t";     // tab
+        if (c == 34) r += "\\\"";
+        else if (c == 92) r += "\\\\";
+        else if (c == 10) r += "\\n";
+        else if (c == 13) r += "\\r";
+        else if (c == 9) r += "\\t";
         else
         {
             string ch;
@@ -148,7 +152,6 @@ string mcp_serialize_dict(dictionary &in d)
         string val_str = "";
         bool found = false;
 
-        // 1. Try handle types first (array<dictionary@>, dictionary@)
         {
             array<dictionary@>@ ad;
             if (d.get(k, @ad) && ad !is null)
@@ -166,8 +169,6 @@ string mcp_serialize_dict(dictionary &in d)
                 found = true;
             }
         }
-
-        // 2. String (before double — double.get can match strings in some engines)
         if (!found)
         {
             string sv;
@@ -177,8 +178,6 @@ string mcp_serialize_dict(dictionary &in d)
                 found = true;
             }
         }
-
-        // 3. Double/number
         if (!found)
         {
             double dv;
@@ -191,9 +190,6 @@ string mcp_serialize_dict(dictionary &in d)
                 found = true;
             }
         }
-
-        // 4. array<string> — must come BEFORE bool: non-null object handles coerce to bool=true
-        //    in AngelScript's dictionary, so checking bool first would eat every array<string>.
         if (!found)
         {
             array<string> sa;
@@ -203,8 +199,6 @@ string mcp_serialize_dict(dictionary &in d)
                 found = true;
             }
         }
-
-        // 5. Bool
         if (!found)
         {
             bool bv;
@@ -229,6 +223,7 @@ void send_response(dictionary &in res)
 {
     if (!g_ws.is_open()) return;
     string json = mcp_serialize_dict(res);
+    dbg("SEND: " + json.substr(0, 200) + (json.length() > 200 ? "...[" + json.length() + " chars total]" : ""));
     g_ws.send_text(json);
 }
 
@@ -259,6 +254,7 @@ void cmd_attach(dictionary &in req, dictionary &inout res)
 {
     string name = get_dict_string(req, "name");
     double pid_d = get_dict_double(req, "pid");
+    dbg("attach: name='" + name + "' pid=" + pid_d);
 
     if (g_attached && g_proc.alive())
         g_proc.deref();
@@ -275,6 +271,7 @@ void cmd_attach(dictionary &in req, dictionary &inout res)
 
     if (!g_proc.alive())
     {
+        dbg("attach: FAILED — process not found");
         g_attached = false;
         res.set("error", "attach failed");
         return;
@@ -285,10 +282,12 @@ void cmd_attach(dictionary &in req, dictionary &inout res)
     res.set("pid", double(g_proc.pid()));
     res.set("base", to_hex(g_proc.base_address()));
     res.set("peb", to_hex(g_proc.peb()));
+    dbg("attach: OK pid=" + g_proc.pid() + " base=" + to_hex(g_proc.base_address()));
 }
 
 void cmd_detach(dictionary &inout res)
 {
+    dbg("detach");
     if (g_proc.alive())
         g_proc.deref();
     g_proc = proc_t();
@@ -298,6 +297,7 @@ void cmd_detach(dictionary &inout res)
 
 void cmd_process_info(dictionary &inout res)
 {
+    dbg("process_info");
     if (!g_attached || !g_proc.alive())
     {
         res.set("error", "not attached");
@@ -307,13 +307,16 @@ void cmd_process_info(dictionary &inout res)
     res.set("base", to_hex(g_proc.base_address()));
     res.set("peb", to_hex(g_proc.peb()));
     res.set("alive", g_proc.alive());
+    dbg("process_info: pid=" + g_proc.pid());
 }
 
 void cmd_is_valid_address(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
-    res.set("valid", g_proc.is_valid_address(addr));
+    bool valid = g_proc.is_valid_address(addr);
+    dbg("is_valid_address: " + to_hex(addr) + " -> " + valid);
+    res.set("valid", valid);
     res.set("address", to_hex(addr));
 }
 
@@ -322,15 +325,17 @@ void cmd_read_memory(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint size = uint(get_dict_double(req, "size"));
+    dbg("read_memory: addr=" + to_hex(addr) + " size=" + size);
     if (size == 0 || size > 1048576) { res.set("error", "invalid size (max 1MB)"); return; }
 
     array<uint8> data;
     g_proc.rvm(addr, size, data);
-    if (data.length() != size) { res.set("error", "read failed"); return; }
+    if (data.length() != size) { dbg("read_memory: FAILED got " + data.length() + " bytes"); res.set("error", "read failed"); return; }
 
     res.set("data", bytes_to_hex(data));
     res.set("address", to_hex(addr));
     res.set("size", double(size));
+    dbg("read_memory: OK " + data.length() + " bytes");
 }
 
 void cmd_read_values(dictionary &in req, dictionary &inout res)
@@ -341,6 +346,7 @@ void cmd_read_values(dictionary &in req, dictionary &inout res)
     uint count = uint(get_dict_double(req, "count", 1));
     if (count == 0) count = 1;
     if (count > 1024) count = 1024;
+    dbg("read_values: addr=" + to_hex(addr) + " type=" + type + " count=" + count);
 
     array<dictionary@> values;
     for (uint i = 0; i < count; i++)
@@ -358,11 +364,11 @@ void cmd_read_values(dictionary &in req, dictionary &inout res)
         else if (type == "f32") { a += i * 4; v.set("value", double(g_proc.rf32(a))); }
         else if (type == "f64") { a += i * 8; v.set("value", g_proc.rf64(a)); }
         else { res.set("error", "unknown type: " + type); return; }
-
         v.set("address", to_hex(a));
         values.insertLast(@v);
     }
     res.set("values", @values);
+    dbg("read_values: OK count=" + values.length());
 }
 
 void cmd_read_string(dictionary &in req, dictionary &inout res)
@@ -370,8 +376,11 @@ void cmd_read_string(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     int max_len = int(get_dict_double(req, "max_length", 256));
-    res.set("value", g_proc.rs(addr, max_len));
+    dbg("read_string: addr=" + to_hex(addr) + " max=" + max_len);
+    string val = g_proc.rs(addr, max_len);
+    res.set("value", val);
     res.set("address", to_hex(addr));
+    dbg("read_string: '" + val.substr(0, 64) + "'");
 }
 
 void cmd_read_wstring(dictionary &in req, dictionary &inout res)
@@ -379,8 +388,11 @@ void cmd_read_wstring(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     int max_len = int(get_dict_double(req, "max_length", 256));
-    res.set("value", g_proc.rws(addr, max_len));
+    dbg("read_wstring: addr=" + to_hex(addr) + " max=" + max_len);
+    string val = g_proc.rws(addr, max_len);
+    res.set("value", val);
     res.set("address", to_hex(addr));
+    dbg("read_wstring: '" + val.substr(0, 64) + "'");
 }
 
 void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
@@ -388,10 +400,10 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "base"));
     string final_type = get_dict_string(req, "final_type", "ptr");
+    dbg("read_pointer_chain: base=" + to_hex(addr) + " final_type=" + final_type);
 
     array<string> offsets_arr;
     array<dictionary@>@ offsets_raw;
-    // offsets come as array of strings
     if (!req.get("offsets", @offsets_raw))
     {
         res.set("error", "missing offsets array");
@@ -400,38 +412,20 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
 
     array<dictionary@> chain_steps;
 
-    // Follow the pointer chain
     for (uint i = 0; i < offsets_raw.length(); i++)
     {
-        // Each element is a string in the array
-        string off_str;
-        // The MCP sends offsets as array of strings, but JSON arrays become array<dictionary@>
-        // Try to extract string value
-        // Actually in Perception JSON, arrays of strings come as... let's handle both
         uint64 prev_addr = addr;
         string offset_hex;
-
-        // Read offset from the dictionary (JSON array element)
         if (offsets_raw[i] !is null)
         {
-            // Try to get as string directly - won't work for plain string arrays
-            // In Perception JSON, string arrays might be different
         }
-
-        // Fallback: parse from request directly
-        // The offsets are sent as an array of strings in JSON
-        // Let's try a different approach - get the offsets as a single comma-separated string
     }
 
-    // Alternative: use offsets_csv field
     string offsets_csv = get_dict_string(req, "offsets_csv", "");
     array<string> off_parts;
 
-    // Parse the offsets - they should be available somehow
-    // Let's use the raw array approach
     if (offsets_csv == "" && offsets_raw !is null)
     {
-        // Read pointer through each offset
         for (uint i = 0; i < offsets_raw.length(); i++)
         {
             string os;
@@ -439,8 +433,8 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
             {
                 uint64 offset = parse_hex(os);
                 uint64 ptr = g_proc.ru64(addr);
+                dbg("read_pointer_chain: step " + i + " read=" + to_hex(addr) + " ptr=" + to_hex(ptr) + " +offset=" + to_hex(offset));
                 if (ptr == 0) { res.set("error", "null pointer at step " + i + " addr=" + to_hex(addr)); return; }
-
                 dictionary step;
                 step.set("step", double(i));
                 step.set("read_from", to_hex(addr));
@@ -453,8 +447,6 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
         }
     }
 
-    // Actually, let me just handle offsets as a comma-separated string sent from MCP
-    // The MCP side will convert the array to CSV
     if (offsets_csv != "")
     {
         array<string> parts = str_split(offsets_csv, ",");
@@ -462,8 +454,8 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
         {
             uint64 offset = parse_hex(parts[i]);
             uint64 ptr = g_proc.ru64(addr);
+            dbg("read_pointer_chain: step " + i + " read=" + to_hex(addr) + " ptr=" + to_hex(ptr) + " +offset=" + to_hex(offset));
             if (ptr == 0) { res.set("error", "null pointer at step " + i + " addr=" + to_hex(addr)); return; }
-
             dictionary step;
             step.set("step", double(i));
             step.set("read_from", to_hex(addr));
@@ -478,7 +470,6 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
     res.set("chain", @chain_steps);
     res.set("final_address", to_hex(addr));
 
-    // Read final value
     if (final_type == "u8")       res.set("final_value", double(g_proc.ru8(addr)));
     else if (final_type == "u16") res.set("final_value", double(g_proc.ru16(addr)));
     else if (final_type == "u32") res.set("final_value", double(g_proc.ru32(addr)));
@@ -486,39 +477,29 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
     else if (final_type == "i32") res.set("final_value", double(g_proc.r32(addr)));
     else if (final_type == "f32") res.set("final_value", double(g_proc.rf32(addr)));
     else if (final_type == "f64") res.set("final_value", g_proc.rf64(addr));
-    else /* ptr */                res.set("final_value", to_hex(g_proc.ru64(addr)));
+    else                          res.set("final_value", to_hex(g_proc.ru64(addr)));
+    dbg("read_pointer_chain: final=" + to_hex(addr));
 }
 
 void cmd_read_struct(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 base_addr = parse_hex(get_dict_string(req, "address"));
-
-    // Fields come as a JSON string from the MCP server
     string fields_json = get_dict_string(req, "fields_json");
+    dbg("read_struct: base=" + to_hex(base_addr) + " fields_json length=" + fields_json.length());
     if (fields_json == "") { res.set("error", "missing fields_json"); return; }
 
-    // Parse the JSON array of field descriptors
-    // Format: [{"name":"x","offset":"0x10","type":"f32"},...]
-    // We'll parse manually since AngelScript JSON parse gives a dictionary, not array
-    // Use a simple approach: parse each field from the JSON string
-
     array<dictionary@> result;
-
-    // Simple JSON array parser for our specific format
     int pos = 0;
     while (pos < int(fields_json.length()))
     {
-        // Find next '{'
         int obj_start = fields_json.findFirst("{", pos);
         if (obj_start < 0) break;
         int obj_end = fields_json.findFirst("}", obj_start);
         if (obj_end < 0) break;
-
         string obj_str = fields_json.substr(obj_start, obj_end - obj_start + 1);
         pos = obj_end + 1;
 
-        // Parse the object
         dictionary field_def;
         string err;
         if (!json_parse(obj_str, field_def, err)) continue;
@@ -549,9 +530,11 @@ void cmd_read_struct(dictionary &in req, dictionary &inout res)
         else if (type == "ptr")  f.set("value", to_hex(g_proc.ru64(addr)));
         else f.set("value", "unknown type: " + type);
 
+        dbg("read_struct: field '" + name + "' @+" + to_hex(offset));
         result.insertLast(@f);
     }
     res.set("fields", @result);
+    dbg("read_struct: OK " + result.length() + " fields");
 }
 
 void cmd_read_pointer_array(dictionary &in req, dictionary &inout res)
@@ -560,15 +543,17 @@ void cmd_read_pointer_array(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint count = uint(get_dict_double(req, "count"));
     int delta = int(get_dict_double(req, "offset_delta"));
+    dbg("read_pointer_array: addr=" + to_hex(addr) + " count=" + count + " delta=" + delta);
 
     array<uint64>@ ptrs = g_proc.read_pointer_array(addr, count, delta);
-    if (ptrs is null) { res.set("error", "read_pointer_array failed"); return; }
+    if (ptrs is null) { dbg("read_pointer_array: FAILED"); res.set("error", "read_pointer_array failed"); return; }
 
     array<string> hex_ptrs;
     for (uint i = 0; i < ptrs.length(); i++)
         hex_ptrs.insertLast(to_hex(ptrs[i]));
     res.set("pointers", hex_ptrs);
     res.set("count", double(ptrs.length()));
+    dbg("read_pointer_array: OK " + ptrs.length() + " pointers");
 }
 
 // ─── Write Commands ──────────────────────────────────────────────────
@@ -578,6 +563,7 @@ void cmd_write_memory(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     string hex = get_dict_string(req, "data");
+    dbg("write_memory: addr=" + to_hex(addr) + " hex_len=" + hex.length());
 
     string raw, err;
     if (!util_hex_decode(hex, raw, err)) { res.set("error", "invalid hex: " + err); return; }
@@ -588,9 +574,15 @@ void cmd_write_memory(dictionary &in req, dictionary &inout res)
         bytes[i] = uint8(raw[i]);
 
     if (g_proc.wvm(addr, bytes))
+    {
         res.set("result", "wrote " + bytes.length() + " bytes");
+        dbg("write_memory: OK " + bytes.length() + " bytes");
+    }
     else
+    {
+        dbg("write_memory: FAILED");
         res.set("error", "write failed");
+    }
 }
 
 void cmd_write_values(dictionary &in req, dictionary &inout res)
@@ -599,6 +591,7 @@ void cmd_write_values(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     string type = get_dict_string(req, "type");
     string values_csv = get_dict_string(req, "values_csv");
+    dbg("write_values: addr=" + to_hex(addr) + " type=" + type + " csv='" + values_csv + "'");
     if (values_csv == "") { res.set("error", "missing values_csv"); return; }
 
     array<string> parts = str_split(values_csv, ",");
@@ -621,6 +614,7 @@ void cmd_write_values(dictionary &in req, dictionary &inout res)
         if (ok) written++;
     }
     res.set("result", "wrote " + written + " values");
+    dbg("write_values: OK " + written + "/" + parts.length());
 }
 
 void cmd_write_string(dictionary &in req, dictionary &inout res)
@@ -628,6 +622,7 @@ void cmd_write_string(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     string text = get_dict_string(req, "text");
+    dbg("write_string: addr=" + to_hex(addr) + " text='" + text + "'");
     if (g_proc.ws(addr, text))
         res.set("result", "wrote string (" + text.length() + " chars)");
     else
@@ -639,6 +634,7 @@ void cmd_write_wstring(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     string text = get_dict_string(req, "text");
+    dbg("write_wstring: addr=" + to_hex(addr) + " text='" + text + "'");
     if (g_proc.wws(addr, text))
         res.set("result", "wrote wstring (" + text.length() + " chars)");
     else
@@ -675,30 +671,32 @@ void get_scan_region(dictionary &in req, uint64 &out start, uint64 &out size)
     else
     {
         start = g_proc.base_address();
-        uint64 dummy;
-        uint64 mod_size;
-        // Try to get main module size
-        // Use base address with a reasonable default
-        start = g_proc.base_address();
-        size = 0x10000000; // 256MB default scan range
+        size = 0x10000000;
     }
+    dbg("get_scan_region: start=" + to_hex(start) + " size=" + to_hex(size));
 }
 
 void cmd_pattern_scan(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string sig = get_dict_string(req, "signature");
+    dbg("pattern_scan: sig='" + sig + "'");
     if (sig == "") { res.set("error", "missing signature"); return; }
 
     uint64 start, size;
     get_scan_region(req, start, size);
     if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
+    dbg("pattern_scan: scanning " + to_hex(start) + " size=" + to_hex(size));
     uint64 result = g_proc.find_code_pattern(start, size, sig);
     if (result == 0)
+    {
+        dbg("pattern_scan: not found");
         res.set("result", "not found");
+    }
     else
     {
+        dbg("pattern_scan: found at " + to_hex(result));
         res.set("address", to_hex(result));
         res.set("offset_from_base", to_hex(result - start));
     }
@@ -708,6 +706,7 @@ void cmd_pattern_scan_all(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string sig = get_dict_string(req, "signature");
+    dbg("pattern_scan_all: sig='" + sig + "'");
     if (sig == "") { res.set("error", "missing signature"); return; }
 
     uint64 start, size;
@@ -717,6 +716,7 @@ void cmd_pattern_scan_all(dictionary &in req, dictionary &inout res)
     uint max_results = uint(get_dict_double(req, "max_results", 500));
     if (max_results == 0 || max_results > 5000) max_results = 500;
 
+    dbg("pattern_scan_all: scanning " + to_hex(start) + " size=" + to_hex(size) + " max=" + max_results);
     array<uint64> results;
     g_proc.find_all_code_patterns(start, size, sig, results);
 
@@ -729,6 +729,7 @@ void cmd_pattern_scan_all(dictionary &in req, dictionary &inout res)
     res.set("count", double(results.length()));
     if (results.length() > max_results)
         res.set("truncated", true);
+    dbg("pattern_scan_all: found " + results.length() + " matches");
 }
 
 // ─── Module Info ─────────────────────────────────────────────────────
@@ -737,15 +738,20 @@ void cmd_get_module(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string name = get_dict_string(req, "name");
+    dbg("get_module: name='" + name + "'");
     uint64 mod_base, mod_size;
     if (g_proc.get_module(name, mod_base, mod_size))
     {
         res.set("base", to_hex(mod_base));
         res.set("size", to_hex(mod_size));
         res.set("end", to_hex(mod_base + mod_size));
+        dbg("get_module: base=" + to_hex(mod_base) + " size=" + to_hex(mod_size));
     }
     else
+    {
+        dbg("get_module: not found");
         res.set("error", "module not found: " + name);
+    }
 }
 
 void cmd_get_export(dictionary &in req, dictionary &inout res)
@@ -753,9 +759,13 @@ void cmd_get_export(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 mod_base = parse_hex(get_dict_string(req, "module_base"));
     string export_name = get_dict_string(req, "export_name");
+    dbg("get_export: mod=" + to_hex(mod_base) + " name='" + export_name + "'");
     uint64 addr = g_proc.get_proc_address(mod_base, export_name);
     if (addr != 0)
+    {
         res.set("address", to_hex(addr));
+        dbg("get_export: found at " + to_hex(addr));
+    }
     else
         res.set("error", "export not found: " + export_name);
 }
@@ -765,9 +775,13 @@ void cmd_get_import(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 mod_base = parse_hex(get_dict_string(req, "module_base"));
     string import_name = get_dict_string(req, "import_name");
+    dbg("get_import: mod=" + to_hex(mod_base) + " name='" + import_name + "'");
     uint64 addr = g_proc.get_import_rdata_address(mod_base, import_name);
     if (addr != 0)
+    {
         res.set("address", to_hex(addr));
+        dbg("get_import: found at " + to_hex(addr));
+    }
     else
         res.set("error", "import not found: " + import_name);
 }
@@ -781,13 +795,15 @@ void cmd_disassemble(dictionary &in req, dictionary &inout res)
     uint count = uint(get_dict_double(req, "count", 10));
     uint size = uint(get_dict_double(req, "size", 256));
     if (size > 4096) size = 4096;
+    dbg("disassemble: addr=" + to_hex(addr) + " count=" + count + " size=" + size);
 
     array<uint8> code;
     g_proc.rvm(addr, size, code);
-    if (code.length() == 0) { res.set("error", "read failed"); return; }
+    if (code.length() == 0) { dbg("disassemble: read failed"); res.set("error", "read failed"); return; }
 
     array<dictionary@> insts;
     zydis_disasm(code, addr, insts);
+    dbg("disassemble: zydis returned " + insts.length() + " instructions");
 
     uint limit = count < insts.length() ? count : insts.length();
     array<dictionary@> output;
@@ -808,13 +824,13 @@ void cmd_disassemble(dictionary &in req, dictionary &inout res)
         inst.set("text", text);
         inst.set("size", double(length));
 
-        // Get bytes for this instruction
         uint64 offset = uint64(runtime_addr) - addr;
         array<uint8> inst_bytes;
         for (uint b = 0; b < uint(length) && (offset + b) < code.length(); b++)
             inst_bytes.insertLast(code[offset + b]);
         inst.set("bytes", bytes_to_hex(inst_bytes));
 
+        dbg("  " + to_hex(uint64(runtime_addr)) + ": " + text);
         output.insertLast(@inst);
     }
     res.set("instructions", @output);
@@ -827,6 +843,7 @@ void cmd_virtual_query(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
+    dbg("virtual_query: addr=" + to_hex(addr));
     uint64 region_start, region_size;
     uint protection;
     bool heap_likely;
@@ -838,23 +855,29 @@ void cmd_virtual_query(dictionary &in req, dictionary &inout res)
         res.set("region_end", to_hex(region_start + region_size));
         res.set("protection", double(protection));
         res.set("heap_likely", heap_likely);
+        dbg("virtual_query: start=" + to_hex(region_start) + " size=" + to_hex(region_size) + " prot=" + protection + " heap=" + heap_likely);
     }
     else
+    {
+        dbg("virtual_query: FAILED");
         res.set("error", "virtual_query failed");
+    }
 }
 
 void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     bool   heap_only  = get_dict_bool(req, "heap_only");
-    bool   compact    = get_dict_bool(req, "compact");          // return just {start,size} — no metadata
+    bool   compact    = get_dict_bool(req, "compact");
     uint64 min_size   = uint64(get_dict_double(req, "min_size", 0));
     uint64 addr_start = parse_hex(get_dict_string(req, "addr_start", "0x0"));
-    uint64 addr_end   = parse_hex(get_dict_string(req, "addr_end",   "0x0")); // 0 = no upper limit
+    uint64 addr_end   = parse_hex(get_dict_string(req, "addr_end",   "0x0"));
     bool   filter_addr = (addr_end != 0);
+    dbg("get_vad_snapshot: heap_only=" + heap_only + " compact=" + compact + " min_size=" + to_hex(min_size));
 
     array<dictionary@>@ vads = g_proc.get_vad_snapshot(heap_only);
-    if (vads is null) { res.set("error", "VAD snapshot failed"); return; }
+    if (vads is null) { dbg("get_vad_snapshot: FAILED"); res.set("error", "VAD snapshot failed"); return; }
+    dbg("get_vad_snapshot: raw " + vads.length() + " entries");
 
     array<dictionary@> output;
     for (uint i = 0; i < vads.length(); i++)
@@ -886,27 +909,42 @@ void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
     }
     res.set("regions", @output);
     res.set("count", double(output.length()));
+    dbg("get_vad_snapshot: output " + output.length() + " regions");
 }
 
 void cmd_alloc_vm(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint size = uint(get_dict_double(req, "size"));
+    dbg("alloc_vm: size=" + size);
     uint64 addr = g_proc.alloc_vm(size);
     if (addr != 0)
+    {
         res.set("address", to_hex(addr));
+        dbg("alloc_vm: OK addr=" + to_hex(addr));
+    }
     else
+    {
+        dbg("alloc_vm: FAILED");
         res.set("error", "allocation failed");
+    }
 }
 
 void cmd_free_vm(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
+    dbg("free_vm: addr=" + to_hex(addr));
     if (g_proc.free_vm(addr))
+    {
         res.set("result", "freed");
+        dbg("free_vm: OK");
+    }
     else
+    {
+        dbg("free_vm: FAILED");
         res.set("error", "free failed");
+    }
 }
 
 // ─── TEBs ────────────────────────────────────────────────────────────
@@ -914,13 +952,18 @@ void cmd_free_vm(dictionary &in req, dictionary &inout res)
 void cmd_get_tebs(dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
+    dbg("get_tebs");
     array<uint64>@ tebs = g_proc.get_all_tebs();
-    if (tebs is null) { res.set("error", "get_all_tebs failed"); return; }
+    if (tebs is null) { dbg("get_tebs: FAILED"); res.set("error", "get_all_tebs failed"); return; }
     array<string> hex_tebs;
     for (uint i = 0; i < tebs.length(); i++)
+    {
         hex_tebs.insertLast(to_hex(tebs[i]));
+        dbg("  TEB[" + i + "] = " + to_hex(tebs[i]));
+    }
     res.set("tebs", hex_tebs);
     res.set("count", double(tebs.length()));
+    dbg("get_tebs: OK " + tebs.length() + " threads");
 }
 
 // ─── Value Scanning ──────────────────────────────────────────────────
@@ -930,41 +973,47 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string type = get_dict_string(req, "type");
     bool heap_only = get_dict_bool(req, "heap_only");
-
-    // Value can arrive as double or string from JSON
     double num_val = get_dict_double(req, "value", 0);
     string str_val = get_dict_string(req, "value", "");
+    dbg("scan_value: type=" + type + " heap_only=" + heap_only + " num_val=" + num_val + " str_val='" + str_val + "'");
 
     array<uint64>@ results;
     if (type == "u32")
     {
+        dbg("scan_value: calling scan_u32(" + uint(num_val) + ")");
         @results = g_proc.scan_u32(uint(num_val), heap_only);
     }
     else if (type == "u64")
     {
+        dbg("scan_value: calling scan_u64(" + str_val + ")");
         @results = g_proc.scan_u64(parse_hex(str_val), heap_only);
     }
     else if (type == "float")
     {
+        dbg("scan_value: calling scan_float(" + num_val + ")");
         @results = g_proc.scan_float(float(num_val), heap_only);
     }
     else if (type == "double")
     {
+        dbg("scan_value: calling scan_double(" + num_val + ")");
         @results = g_proc.scan_double(num_val, heap_only);
     }
     else if (type == "string")
     {
         string v = get_dict_string(req, "value");
+        dbg("scan_value: calling scan_string('" + v + "')");
         @results = g_proc.scan_string(v, heap_only);
     }
     else if (type == "wstring")
     {
         string v = get_dict_string(req, "value");
+        dbg("scan_value: calling scan_wstring('" + v + "')");
         @results = g_proc.scan_wstring(v, heap_only);
     }
     else if (type == "pointer")
     {
         string v = get_dict_string(req, "value");
+        dbg("scan_value: calling scan_pointer(" + v + ")");
         @results = g_proc.scan_pointer(parse_hex(v), heap_only);
     }
     else
@@ -973,7 +1022,8 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
         return;
     }
 
-    if (results is null) { res.set("error", "scan returned null"); return; }
+    if (results is null) { dbg("scan_value: returned null"); res.set("error", "scan returned null"); return; }
+    dbg("scan_value: raw results=" + results.length());
 
     uint page_offset = uint(get_dict_double(req, "page_offset", 0));
     uint page_limit  = uint(get_dict_double(req, "page_limit",  1000));
@@ -992,6 +1042,7 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
     res.set("page_limit",  double(page_limit));
     if (to < results.length())
         res.set("has_more", true);
+    dbg("scan_value: returning " + hex_results.length() + " of " + results.length() + " results");
 }
 
 // ─── Advanced RE: Cross-references ───────────────────────────────────
@@ -1000,30 +1051,33 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 target = parse_hex(get_dict_string(req, "target"));
+    dbg("find_xrefs: target=" + to_hex(target));
+    if (target == 0) { res.set("error", "invalid target address"); return; }
 
     uint64 start, size;
     get_scan_region(req, start, size);
     if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
-    // Search for relative 32-bit offsets (RIP-relative addressing)
-    // and absolute 64-bit pointers
     array<string> rel_xrefs;
     array<string> abs_xrefs;
 
-    // Scan for absolute pointer references
+    dbg("find_xrefs: scanning for absolute pointer refs...");
     array<uint64>@ ptr_refs = g_proc.scan_pointer(target, false);
     if (ptr_refs !is null)
     {
+        dbg("find_xrefs: scan_pointer returned " + ptr_refs.length() + " hits");
         for (uint i = 0; i < ptr_refs.length() && i < 500; i++)
         {
             if (ptr_refs[i] >= start && ptr_refs[i] < start + size)
                 abs_xrefs.insertLast(to_hex(ptr_refs[i]));
         }
     }
+    else
+        dbg("find_xrefs: scan_pointer returned null");
 
-    // Scan for RIP-relative references (rel32 patterns)
-    // For each 4KB chunk in the region, look for rel32 that points to target
+    dbg("find_xrefs: scanning for relative refs in " + to_hex(start) + "+" + to_hex(size) + "...");
     uint64 chunk_size = 4096;
+    uint chunks_done = 0;
     for (uint64 off = 0; off < size && rel_xrefs.length() < 500; off += chunk_size)
     {
         uint read_sz = uint(chunk_size < (size - off) ? chunk_size : (size - off));
@@ -1033,21 +1087,21 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
 
         for (uint i = 0; i < chunk.length() - 4; i++)
         {
-            // Read 32-bit relative offset
             int32 rel = int32(chunk[i]) | (int32(chunk[i+1]) << 8) | (int32(chunk[i+2]) << 16) | (int32(chunk[i+3]) << 24);
-            uint64 ref_addr = start + off + i + 4; // address after the rel32
+            uint64 ref_addr = start + off + i + 4;
             uint64 resolved = uint64(int64(ref_addr) + int64(rel));
             if (resolved == target)
-            {
-                // Found a relative reference, back up to find the instruction
-                rel_xrefs.insertLast(to_hex(start + off + i - 1)); // likely instruction start is 1 byte before
-            }
+                rel_xrefs.insertLast(to_hex(start + off + i - 1));
         }
+        chunks_done++;
+        if (chunks_done % 1000 == 0)
+            dbg("find_xrefs: scanned " + chunks_done + " chunks, rel_xrefs=" + rel_xrefs.length());
     }
 
     res.set("absolute_refs", abs_xrefs);
     res.set("relative_refs", rel_xrefs);
     res.set("total", double(abs_xrefs.length() + rel_xrefs.length()));
+    dbg("find_xrefs: done abs=" + abs_xrefs.length() + " rel=" + rel_xrefs.length());
 }
 
 // ─── Advanced RE: VTable Analysis ────────────────────────────────────
@@ -1058,14 +1112,16 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
     uint64 vtable_addr = parse_hex(get_dict_string(req, "address"));
     uint max_entries = uint(get_dict_double(req, "max_entries", 50));
     bool disasm_preview = get_dict_bool(req, "disasm_preview");
+    dbg("analyze_vtable: addr=" + to_hex(vtable_addr) + " max=" + max_entries + " disasm=" + disasm_preview);
 
     array<dictionary@> entries;
     for (uint i = 0; i < max_entries; i++)
     {
         uint64 func_ptr = g_proc.ru64(vtable_addr + i * 8);
-        if (func_ptr == 0) break;
-        if (!g_proc.is_valid_address(func_ptr)) break;
+        if (func_ptr == 0) { dbg("analyze_vtable: null at slot " + i); break; }
+        if (!g_proc.is_valid_address(func_ptr)) { dbg("analyze_vtable: invalid addr at slot " + i + ": " + to_hex(func_ptr)); break; }
 
+        dbg("analyze_vtable: slot[" + i + "] = " + to_hex(func_ptr));
         dictionary entry;
         entry.set("index", double(i));
         entry.set("address", to_hex(vtable_addr + i * 8));
@@ -1089,6 +1145,7 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
                     int64 rt_addr;
                     insts[j].get("runtime_address", rt_addr);
                     preview.insertLast(to_hex(uint64(rt_addr)) + ": " + text);
+                    dbg("    " + to_hex(uint64(rt_addr)) + ": " + text);
                 }
                 entry.set("preview", preview);
             }
@@ -1097,6 +1154,7 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
     }
     res.set("entries", @entries);
     res.set("count", double(entries.length()));
+    dbg("analyze_vtable: OK " + entries.length() + " entries");
 }
 
 // ─── Advanced RE: RTTI ───────────────────────────────────────────────
@@ -1105,45 +1163,36 @@ void cmd_read_rtti(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 vtable_addr = parse_hex(get_dict_string(req, "vtable_address"));
+    dbg("read_rtti: vtable_addr=" + to_hex(vtable_addr));
 
-    // Read vtable pointer from object
     uint64 vtable = g_proc.ru64(vtable_addr);
+    dbg("read_rtti: vtable ptr = " + to_hex(vtable));
     if (vtable == 0 || !g_proc.is_valid_address(vtable))
     {
+        dbg("read_rtti: invalid vtable pointer");
         res.set("error", "invalid vtable pointer");
         return;
     }
 
-    // MSVC RTTI: vtable[-1] = pointer to RTTI Complete Object Locator
     uint64 col_ptr = g_proc.ru64(vtable - 8);
+    dbg("read_rtti: COL ptr = " + to_hex(col_ptr));
     if (col_ptr == 0 || !g_proc.is_valid_address(col_ptr))
     {
+        dbg("read_rtti: no COL found");
         res.set("error", "no RTTI COL found at vtable[-1]");
         return;
     }
 
-    // COL structure (64-bit):
-    // +0x00: signature (1 for 64-bit)
-    // +0x04: offset
-    // +0x08: cdOffset
-    // +0x0C: pTypeDescriptor (RVA from module base)
-    // +0x10: pClassHierarchyDescriptor (RVA)
-    // +0x14: pSelf (RVA)
     uint32 sig = g_proc.ru32(col_ptr);
     int32 type_desc_rva = g_proc.r32(col_ptr + 0x0C);
     int32 chd_rva = g_proc.r32(col_ptr + 0x10);
     int32 self_rva = g_proc.r32(col_ptr + 0x14);
+    dbg("read_rtti: sig=" + sig + " type_desc_rva=" + type_desc_rva + " chd_rva=" + chd_rva + " self_rva=" + self_rva);
 
-    // Calculate base from self pointer
     uint64 image_base = col_ptr - uint64(self_rva);
-
-    // Read type descriptor
     uint64 type_desc = image_base + uint64(type_desc_rva);
-    // TypeDescriptor:
-    // +0x00: pVFTable
-    // +0x08: spare
-    // +0x10: name (decorated class name)
     string class_name = g_proc.rs(type_desc + 0x10, 256);
+    dbg("read_rtti: class_name='" + class_name + "' image_base=" + to_hex(image_base));
 
     res.set("vtable", to_hex(vtable));
     res.set("col", to_hex(col_ptr));
@@ -1151,11 +1200,11 @@ void cmd_read_rtti(dictionary &in req, dictionary &inout res)
     res.set("class_name", class_name);
     res.set("signature", double(sig));
 
-    // Read class hierarchy
     uint64 chd = image_base + uint64(chd_rva);
     uint32 num_bases = g_proc.ru32(chd + 0x08);
     int32 base_array_rva = g_proc.r32(chd + 0x0C);
     uint64 base_array = image_base + uint64(base_array_rva);
+    dbg("read_rtti: num_bases=" + num_bases + " base_array=" + to_hex(base_array));
 
     array<string> hierarchy;
     uint limit = num_bases < 32 ? num_bases : 32;
@@ -1166,9 +1215,11 @@ void cmd_read_rtti(dictionary &in req, dictionary &inout res)
         int32 base_td_rva = g_proc.r32(bcd);
         uint64 base_td = image_base + uint64(base_td_rva);
         string base_name = g_proc.rs(base_td + 0x10, 256);
+        dbg("read_rtti:   base[" + i + "] = '" + base_name + "'");
         hierarchy.insertLast(base_name);
     }
     res.set("hierarchy", hierarchy);
+    dbg("read_rtti: OK");
 }
 
 // ─── Advanced RE: Signature Generation ───────────────────────────────
@@ -1179,16 +1230,16 @@ void cmd_generate_signature(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint length = uint(get_dict_double(req, "length", 32));
     if (length > 256) length = 256;
+    dbg("generate_signature: addr=" + to_hex(addr) + " length=" + length);
 
     array<uint8> code;
     g_proc.rvm(addr, length, code);
-    if (code.length() == 0) { res.set("error", "read failed"); return; }
+    if (code.length() == 0) { dbg("generate_signature: read failed"); res.set("error", "read failed"); return; }
 
-    // Disassemble to find relocatable bytes
     array<dictionary@> insts;
     zydis_disasm(code, addr, insts);
+    dbg("generate_signature: disassembled " + insts.length() + " instructions");
 
-    // Build signature by wildcarding displacement/immediate bytes for relative addresses
     array<bool> wildcard;
     wildcard.resize(code.length());
     for (uint i = 0; i < wildcard.length(); i++)
@@ -1200,45 +1251,32 @@ void cmd_generate_signature(dictionary &in req, dictionary &inout res)
         int64 inst_addr, inst_len;
         insts[i].get("runtime_address", inst_addr);
         insts[i].get("length", inst_len);
-
         uint64 offset = uint64(inst_addr) - addr;
 
-        // Check operands for relative/memory references
         array<dictionary@>@ operands;
         if (insts[i].get("operands", @operands) && operands !is null)
         {
             for (uint j = 0; j < operands.length(); j++)
             {
                 if (operands[j] is null) continue;
-                string op_type;
-                operands[j].get("type", op_type);
-
                 bool has_disp;
                 if (operands[j].get("mem_has_displacement", has_disp) && has_disp)
                 {
-                    // Wildcard the last 4 bytes of the instruction (displacement)
                     for (uint b = uint(inst_len) - 4; b < uint(inst_len); b++)
-                    {
                         if (offset + b < wildcard.length())
                             wildcard[offset + b] = true;
-                    }
                 }
-
                 bool is_relative;
                 if (operands[j].get("imm_is_relative", is_relative) && is_relative)
                 {
-                    // Wildcard immediate relative bytes
                     for (uint b = uint(inst_len) - 4; b < uint(inst_len); b++)
-                    {
                         if (offset + b < wildcard.length())
                             wildcard[offset + b] = true;
-                    }
                 }
             }
         }
     }
 
-    // Build IDA-style signature
     string sig = "";
     for (uint i = 0; i < code.length(); i++)
     {
@@ -1258,6 +1296,7 @@ void cmd_generate_signature(dictionary &in req, dictionary &inout res)
     res.set("signature", sig);
     res.set("address", to_hex(addr));
     res.set("length", double(code.length()));
+    dbg("generate_signature: sig='" + sig.substr(0, 80) + (sig.length() > 80 ? "..." : "") + "'");
 }
 
 // ─── Advanced RE: Function Bounds ────────────────────────────────────
@@ -1266,8 +1305,8 @@ void cmd_find_function_bounds(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
+    dbg("find_function_bounds: addr=" + to_hex(addr));
 
-    // Scan backwards for common function prologues
     uint64 func_start = 0;
     for (uint64 off = 0; off < 0x10000; off++)
     {
@@ -1276,25 +1315,19 @@ void cmd_find_function_bounds(dictionary &in req, dictionary &inout res)
         g_proc.rvm(check, 4, bytes);
         if (bytes.length() < 4) continue;
 
-        // Common x64 prologues:
-        // push rbp = 55, mov rbp,rsp = 48 89 E5
-        // sub rsp, XX = 48 83 EC XX or 48 81 EC XX XX XX XX
-        // push rbx = 53
-        // Also check for CC CC padding before function
         if (off > 0)
         {
             uint8 prev = g_proc.ru8(check - 1);
-            if (prev == 0xCC || prev == 0x90) // int3 or nop padding
+            if (prev == 0xCC || prev == 0x90)
             {
-                // Check if this looks like a prologue
-                if (bytes[0] == 0x55 || // push rbp
-                    bytes[0] == 0x53 || // push rbx
-                    (bytes[0] == 0x48 && bytes[1] == 0x89) || // mov r64, r64
-                    (bytes[0] == 0x48 && bytes[1] == 0x83 && bytes[2] == 0xEC) || // sub rsp, imm8
-                    (bytes[0] == 0x48 && bytes[1] == 0x81 && bytes[2] == 0xEC) || // sub rsp, imm32
-                    (bytes[0] == 0x40 && bytes[1] == 0x53) || // push rbx (REX)
-                    (bytes[0] == 0x40 && bytes[1] == 0x55) || // push rbp (REX)
-                    (bytes[0] == 0x48 && bytes[1] == 0x8B && bytes[2] == 0xC4)) // mov rax, rsp
+                if (bytes[0] == 0x55 ||
+                    bytes[0] == 0x53 ||
+                    (bytes[0] == 0x48 && bytes[1] == 0x89) ||
+                    (bytes[0] == 0x48 && bytes[1] == 0x83 && bytes[2] == 0xEC) ||
+                    (bytes[0] == 0x48 && bytes[1] == 0x81 && bytes[2] == 0xEC) ||
+                    (bytes[0] == 0x40 && bytes[1] == 0x53) ||
+                    (bytes[0] == 0x40 && bytes[1] == 0x55) ||
+                    (bytes[0] == 0x48 && bytes[1] == 0x8B && bytes[2] == 0xC4))
                 {
                     func_start = check;
                     break;
@@ -1305,11 +1338,12 @@ void cmd_find_function_bounds(dictionary &in req, dictionary &inout res)
 
     if (func_start == 0)
     {
+        dbg("find_function_bounds: could not find start");
         res.set("error", "could not find function start");
         return;
     }
+    dbg("find_function_bounds: start=" + to_hex(func_start));
 
-    // Scan forward for ret instruction
     uint64 func_end = 0;
     array<uint8> scan_buf;
     uint scan_size = 0x10000;
@@ -1317,6 +1351,7 @@ void cmd_find_function_bounds(dictionary &in req, dictionary &inout res)
 
     array<dictionary@> insts;
     zydis_disasm(scan_buf, func_start, insts);
+    dbg("find_function_bounds: disassembled " + insts.length() + " instructions");
 
     for (uint i = 0; i < insts.length(); i++)
     {
@@ -1339,7 +1374,10 @@ void cmd_find_function_bounds(dictionary &in req, dictionary &inout res)
     {
         res.set("end", to_hex(func_end));
         res.set("size", double(func_end - func_start));
+        dbg("find_function_bounds: end=" + to_hex(func_end) + " size=" + (func_end - func_start));
     }
+    else
+        dbg("find_function_bounds: end not found");
 }
 
 // ─── Advanced RE: Function Analysis ──────────────────────────────────
@@ -1350,13 +1388,15 @@ void cmd_analyze_function(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint max_size = uint(get_dict_double(req, "max_size", 4096));
     if (max_size > 65536) max_size = 65536;
+    dbg("analyze_function: addr=" + to_hex(addr) + " max_size=" + max_size);
 
     array<uint8> code;
     g_proc.rvm(addr, max_size, code);
-    if (code.length() == 0) { res.set("error", "read failed"); return; }
+    if (code.length() == 0) { dbg("analyze_function: read failed"); res.set("error", "read failed"); return; }
 
     array<dictionary@> insts;
     zydis_disasm(code, addr, insts);
+    dbg("analyze_function: disassembled " + insts.length() + " instructions");
 
     array<dictionary@> output;
     array<string> call_targets;
@@ -1377,10 +1417,8 @@ void cmd_analyze_function(dictionary &in req, dictionary &inout res)
         inst.set("text", text);
         inst.set("mnemonic", mnemonic);
 
-        // Track calls and jumps
         if (mnemonic == "call" || mnemonic == "CALL")
         {
-            // Try to resolve target from operands
             array<dictionary@>@ operands;
             if (insts[i].get("operands", @operands) && operands !is null)
             {
@@ -1389,7 +1427,10 @@ void cmd_analyze_function(dictionary &in req, dictionary &inout res)
                     if (operands[j] is null) continue;
                     int64 abs_addr;
                     if (operands[j].get("imm_absolute_address", abs_addr))
+                    {
                         call_targets.insertLast(to_hex(uint64(abs_addr)));
+                        dbg("analyze_function:   CALL -> " + to_hex(uint64(abs_addr)));
+                    }
                 }
             }
         }
@@ -1408,16 +1449,17 @@ void cmd_analyze_function(dictionary &in req, dictionary &inout res)
             }
         }
 
+        dbg("  " + to_hex(uint64(rt_addr)) + ": " + text);
         output.insertLast(@inst);
 
-        // Stop at ret
-        if (mnemonic == "ret" || mnemonic == "RET") break;
+        if (mnemonic == "ret" || mnemonic == "RET") { dbg("analyze_function: hit RET at " + to_hex(uint64(rt_addr))); break; }
     }
 
     res.set("instructions", @output);
     res.set("instruction_count", double(output.length()));
     res.set("call_targets", call_targets);
     res.set("jump_targets", jump_targets);
+    dbg("analyze_function: OK insts=" + output.length() + " calls=" + call_targets.length() + " jumps=" + jump_targets.length());
 }
 
 // ─── Memory Dump & Diff ─────────────────────────────────────────────
@@ -1428,13 +1470,13 @@ void cmd_dump_memory_region(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint size = uint(get_dict_double(req, "size"));
     string label = get_dict_string(req, "label");
+    dbg("dump_memory_region: addr=" + to_hex(addr) + " size=" + size + " label='" + label + "'");
     if (size > 1048576) { res.set("error", "max 1MB"); return; }
 
     array<uint8> data;
     g_proc.rvm(addr, size, data);
-    if (data.length() != size) { res.set("error", "read failed"); return; }
+    if (data.length() != size) { dbg("dump_memory_region: read failed got " + data.length()); res.set("error", "read failed"); return; }
 
-    // Store snapshot
     dictionary snap;
     snap.set("address", to_hex(addr));
     snap.set("size", double(size));
@@ -1442,12 +1484,14 @@ void cmd_dump_memory_region(dictionary &in req, dictionary &inout res)
     g_snapshots.set(label, @snap);
 
     res.set("result", "snapshot '" + label + "' saved (" + size + " bytes at " + to_hex(addr) + ")");
+    dbg("dump_memory_region: snapshot '" + label + "' saved");
 }
 
 void cmd_diff_memory(dictionary &in req, dictionary &inout res)
 {
     string label_a = get_dict_string(req, "label_a");
     string label_b = get_dict_string(req, "label_b");
+    dbg("diff_memory: '" + label_a + "' vs '" + label_b + "'");
 
     dictionary@ snap_a, snap_b;
     if (!g_snapshots.get(label_a, @snap_a)) { res.set("error", "snapshot '" + label_a + "' not found"); return; }
@@ -1462,6 +1506,7 @@ void cmd_diff_memory(dictionary &in req, dictionary &inout res)
     util_hex_decode(hex_b, raw_b, err);
 
     uint min_len = raw_a.length() < raw_b.length() ? raw_a.length() : raw_b.length();
+    dbg("diff_memory: comparing " + min_len + " bytes");
 
     array<dictionary@> diffs;
     for (uint i = 0; i < min_len; i++)
@@ -1473,6 +1518,7 @@ void cmd_diff_memory(dictionary &in req, dictionary &inout res)
             d.set("a", double(uint8(raw_a[i])));
             d.set("b", double(uint8(raw_b[i])));
             diffs.insertLast(@d);
+            dbg("  diff @+" + to_hex(i) + ": " + uint8(raw_a[i]) + " -> " + uint8(raw_b[i]));
             if (diffs.length() >= 1000) break;
         }
     }
@@ -1482,6 +1528,7 @@ void cmd_diff_memory(dictionary &in req, dictionary &inout res)
     res.set("compared_bytes", double(min_len));
     if (raw_a.length() != raw_b.length())
         res.set("size_mismatch", true);
+    dbg("diff_memory: OK " + diffs.length() + " differences");
 }
 
 // ─── Pointer Scan ────────────────────────────────────────────────────
@@ -1495,9 +1542,12 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
     uint   page_offset = uint(get_dict_double(req, "page_offset", 0));
     uint   page_limit  = uint(get_dict_double(req, "page_limit",  1000));
     if (page_limit == 0 || page_limit > 5000) page_limit = 1000;
+    dbg("scan_pointer_to: target=" + to_hex(target) + " heap_only=" + heap_only + " page_offset=" + page_offset + " page_limit=" + page_limit);
 
+    dbg("scan_pointer_to: calling g_proc.scan_pointer...");
     array<uint64>@ results = g_proc.scan_pointer(target, heap_only);
-    if (results is null) { res.set("error", "scan failed"); return; }
+    if (results is null) { dbg("scan_pointer_to: scan_pointer returned null"); res.set("error", "scan failed"); return; }
+    dbg("scan_pointer_to: scan_pointer returned " + results.length() + " results");
 
     array<string> hex_results;
     uint from = page_offset < results.length() ? page_offset : results.length();
@@ -1512,6 +1562,7 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
     res.set("page_limit",  double(page_limit));
     if (to < results.length())
         res.set("has_more", true);
+    dbg("scan_pointer_to: returning " + hex_results.length() + " of " + results.length());
 }
 
 // ─── String References ──────────────────────────────────────────────
@@ -1521,21 +1572,27 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string search = get_dict_string(req, "search_text");
     if (search.length() == 0) { res.set("error", "search_text is empty"); return; }
+    dbg("find_string_refs: search='" + search + "'");
 
-    // First find the strings in memory
+    dbg("find_string_refs: calling scan_string...");
     array<uint64>@ string_addrs = g_proc.scan_string(search, false);
+    dbg("find_string_refs: scan_string returned " + (string_addrs is null ? "null" : "" + string_addrs.length()) + " hits");
+
+    dbg("find_string_refs: calling scan_wstring...");
     array<uint64>@ wstring_addrs = g_proc.scan_wstring(search, false);
+    dbg("find_string_refs: scan_wstring returned " + (wstring_addrs is null ? "null" : "" + wstring_addrs.length()) + " hits");
 
     array<dictionary@> refs;
 
-    // For each found string, look for pointers to it
     if (string_addrs !is null)
     {
         for (uint i = 0; i < string_addrs.length() && i < 20; i++)
         {
+            dbg("find_string_refs: scanning pointers to ANSI match[" + i + "] @ " + to_hex(string_addrs[i]));
             array<uint64>@ ptrs = g_proc.scan_pointer(string_addrs[i], false);
             if (ptrs !is null)
             {
+                dbg("find_string_refs:   -> " + ptrs.length() + " pointer refs");
                 for (uint j = 0; j < ptrs.length() && j < 50; j++)
                 {
                     dictionary r;
@@ -1552,9 +1609,11 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
     {
         for (uint i = 0; i < wstring_addrs.length() && i < 20; i++)
         {
+            dbg("find_string_refs: scanning pointers to wide match[" + i + "] @ " + to_hex(wstring_addrs[i]));
             array<uint64>@ ptrs = g_proc.scan_pointer(wstring_addrs[i], false);
             if (ptrs !is null)
             {
+                dbg("find_string_refs:   -> " + ptrs.length() + " pointer refs");
                 for (uint j = 0; j < ptrs.length() && j < 50; j++)
                 {
                     dictionary r;
@@ -1569,6 +1628,7 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 
     res.set("references", @refs);
     res.set("count", double(refs.length()));
+    dbg("find_string_refs: done, " + refs.length() + " total refs");
 }
 
 // ─── Unicorn Emulation ──────────────────────────────────────────────
@@ -1581,42 +1641,45 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     uint code_size = uint(get_dict_double(req, "code_size"));
     uint entry_offset = uint(get_dict_double(req, "entry_offset", 0));
     uint max_insts = uint(get_dict_double(req, "max_instructions", 10000));
+    dbg("emulate_code: code_addr=" + to_hex(code_addr) + " code_size=" + code_size + " entry_offset=" + entry_offset + " max_insts=" + max_insts);
 
-    // Read code from target
     array<uint8> code;
     g_proc.rvm(code_addr, code_size, code);
-    if (code.length() == 0) { res.set("error", "failed to read code"); return; }
+    if (code.length() == 0) { dbg("emulate_code: read failed"); res.set("error", "failed to read code"); return; }
+    dbg("emulate_code: read " + code.length() + " bytes");
 
-    // Create UC instance
     uint64 uc = uc_create();
-    if (uc == 0) { res.set("error", "uc_create failed"); return; }
+    if (uc == 0) { dbg("emulate_code: uc_create failed"); res.set("error", "uc_create failed"); return; }
+    dbg("emulate_code: uc_create OK handle=" + uc);
 
-    // Map code
     uint64 map_addr = 0x10000;
-    uint64 map_size = ((code_size + 0xFFF) & ~0xFFF);  // page-align
+    uint64 map_size = ((code_size + 0xFFF) & ~0xFFF);
+    dbg("emulate_code: mapping code at " + to_hex(map_addr) + " size=" + to_hex(map_size));
     if (!uc_mem_map(uc, map_addr, map_size, UC_PROT_ALL))
     {
         uc_close(uc);
+        dbg("emulate_code: uc_mem_map failed");
         res.set("error", "uc_mem_map failed");
         return;
     }
     uc_mem_write(uc, map_addr, code);
 
-    // Setup stack (uc_setup_stack maps stack + stop page internally)
     uint64 stack_base = 0x100000;
     uint64 stack_size = 0x10000;
     uint64 stop_addr = 0xDEAD0000;
+    dbg("emulate_code: setting up stack at " + to_hex(stack_base) + " stop=" + to_hex(stop_addr));
     if (!uc_setup_stack(uc, stack_base, stack_size, stop_addr))
     {
         uc_close(uc);
+        dbg("emulate_code: uc_setup_stack failed");
         res.set("error", "uc_setup_stack failed");
         return;
     }
 
-    // Map additional regions if requested
     array<dictionary@>@ map_regions;
     if (req.get("map_regions", @map_regions) && map_regions !is null)
     {
+        dbg("emulate_code: mapping " + map_regions.length() + " extra regions");
         for (uint i = 0; i < map_regions.length(); i++)
         {
             if (map_regions[i] is null) continue;
@@ -1631,15 +1694,16 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
             {
                 uc_mem_map(uc, aligned_addr, aligned_size, UC_PROT_ALL);
                 uc_mem_write(uc, r_addr, region_data);
+                dbg("emulate_code:   mapped " + to_hex(aligned_addr) + " size=" + to_hex(aligned_size));
             }
         }
     }
 
-    // Set initial registers
     dictionary@ regs;
     if (req.get("registers", @regs) && regs !is null)
     {
         array<string> reg_names = regs.getKeys();
+        dbg("emulate_code: setting " + reg_names.length() + " registers");
         for (uint i = 0; i < reg_names.length(); i++)
         {
             string rn = reg_names[i];
@@ -1665,17 +1729,20 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
             else if (rn == "rbp" || rn == "RBP") reg_id = UC_X86_REG_RBP;
 
             if (reg_id >= 0)
+            {
                 uc_reg_write64(uc, reg_id, val);
+                dbg("emulate_code:   " + rn + " = " + to_hex(val));
+            }
         }
     }
 
-    // Execute
     uint64 start_addr = map_addr + entry_offset;
+    dbg("emulate_code: starting emulation at " + to_hex(start_addr));
     bool emu_ok = uc_start(uc, start_addr, stop_addr, 0, max_insts) != 0;
+    dbg("emulate_code: uc_start returned emu_ok=" + emu_ok);
 
     res.set("success", emu_ok);
 
-    // Read output registers
     dictionary reg_out;
     reg_out.set("rax", to_hex(uc_reg_read64(uc, UC_X86_REG_RAX)));
     reg_out.set("rbx", to_hex(uc_reg_read64(uc, UC_X86_REG_RBX)));
@@ -1687,24 +1754,25 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     reg_out.set("r9",  to_hex(uc_reg_read64(uc, UC_X86_REG_R9)));
     reg_out.set("rip", to_hex(uc_reg_read64(uc, UC_X86_REG_RIP)));
     res.set("registers", @reg_out);
+    dbg("emulate_code: rax=" + to_hex(uc_reg_read64(uc, UC_X86_REG_RAX)) + " rip=" + to_hex(uc_reg_read64(uc, UC_X86_REG_RIP)));
 
-    // Always check exception state
     int exc = uc_get_last_exception(uc);
     if (exc != 0)
     {
         res.set("exception", double(exc));
         res.set("exception_address", to_hex(uc_get_exception_address(uc)));
+        dbg("emulate_code: EXCEPTION code=" + exc + " at " + to_hex(uc_get_exception_address(uc)));
     }
 
     uc_close(uc);
+    dbg("emulate_code: done");
 }
 
 // ─── Assemble ────────────────────────────────────────────────────────
 
 void cmd_assemble(dictionary &in req, dictionary &inout res)
 {
-    // This is a simplified assembler - for complex assembly, use the Zydis encoder API
-    // For now, support common instructions
+    dbg("assemble: not implemented, use write_memory or emulate_code");
     res.set("error", "use write_memory with pre-assembled hex bytes, or emulate_code for execution");
 }
 
@@ -1716,18 +1784,16 @@ void cmd_hex_dump(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint size = uint(get_dict_double(req, "size", 256));
     if (size > 4096) size = 4096;
+    dbg("hex_dump: addr=" + to_hex(addr) + " size=" + size);
 
     array<uint8> data;
     g_proc.rvm(addr, size, data);
-    if (data.length() == 0) { res.set("error", "read failed"); return; }
+    if (data.length() == 0) { dbg("hex_dump: read failed"); res.set("error", "read failed"); return; }
 
     string dump = "";
     for (uint i = 0; i < data.length(); i += 16)
     {
-        // Address
         dump += to_hex(addr + i) + ": ";
-
-        // Hex bytes
         string hex_part = "";
         string ascii_part = "";
         for (uint j = 0; j < 16; j++)
@@ -1740,7 +1806,6 @@ void cmd_hex_dump(dictionary &in req, dictionary &inout res)
                 hex_part += HEX_UPPER.substr(hi, 1);
                 hex_part += HEX_UPPER.substr(lo, 1);
                 hex_part += " ";
-
                 if (b >= 32 && b < 127)
                 {
                     string ch;
@@ -1756,16 +1821,15 @@ void cmd_hex_dump(dictionary &in req, dictionary &inout res)
                 hex_part += "   ";
                 ascii_part += " ";
             }
-
             if (j == 7) hex_part += " ";
         }
-
         dump += hex_part + " |" + ascii_part + "|\n";
     }
 
     res.set("dump", dump);
     res.set("address", to_hex(addr));
     res.set("size", double(data.length()));
+    dbg("hex_dump: OK " + data.length() + " bytes");
 }
 
 // ─── CS2 Specific ───────────────────────────────────────────────────
@@ -1775,18 +1839,27 @@ void cmd_cs2_get_interface(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 mod_base = parse_hex(get_dict_string(req, "module_base"));
     string iface_name = get_dict_string(req, "interface_name");
+    dbg("cs2_get_interface: mod=" + to_hex(mod_base) + " name='" + iface_name + "'");
     uint64 addr = g_proc.cs2_get_interface(mod_base, iface_name);
     if (addr != 0)
+    {
         res.set("address", to_hex(addr));
+        dbg("cs2_get_interface: found at " + to_hex(addr));
+    }
     else
+    {
+        dbg("cs2_get_interface: not found");
         res.set("error", "interface not found");
+    }
 }
 
 void cmd_cs2_schema_dump(dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
+    dbg("cs2_schema_dump");
     array<dictionary@>@ schema = g_proc.cs2_get_schema_dump();
-    if (schema is null) { res.set("error", "schema dump failed"); return; }
+    if (schema is null) { dbg("cs2_schema_dump: FAILED"); res.set("error", "schema dump failed"); return; }
+    dbg("cs2_schema_dump: got " + schema.length() + " entries");
 
     array<dictionary@> output;
     for (uint i = 0; i < schema.length(); i++)
@@ -1803,13 +1876,10 @@ void cmd_cs2_schema_dump(dictionary &inout res)
     }
     res.set("schema", @output);
     res.set("count", double(output.length()));
+    dbg("cs2_schema_dump: OK " + output.length() + " entries");
 }
 
 // ─── Scan Heap Regions ───────────────────────────────────────────────
-// Scans a caller-supplied list of regions for a value via manual rvm reads.
-// Workaround for scan_value/scan_pointer_to not supporting per-region scans.
-// regions_csv: "0xSTART:0xSIZE,0xSTART:0xSIZE,..." (build from get_vad_snapshot output)
-// type: u32 | u64 | pointer    value: hex string for u64/pointer, number for u32
 
 void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
 {
@@ -1821,6 +1891,7 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     if (max_results == 0 || max_results > 5000) max_results = 100;
 
     if (regions_csv == "") { res.set("error", "missing regions_csv"); return; }
+    dbg("scan_heap_regions: type=" + type + " max_results=" + max_results + " csv_len=" + regions_csv.length());
 
     bool   is_u64 = (type == "u64" || type == "pointer");
     bool   is_u32 = (type == "u32");
@@ -1830,14 +1901,13 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     uint64 u64_val  = 0;
     uint   u32_val  = 0;
     if (is_u64)
-    {
         u64_val = parse_hex(get_dict_string(req, "value"));
-    }
     else
     {
         double dv; req.get("value", dv);
         u32_val = uint(dv);
     }
+    dbg("scan_heap_regions: searching for " + (is_u64 ? to_hex(u64_val) : "" + u32_val));
 
     array<string> region_pairs = str_split(regions_csv, ",");
     array<string> found;
@@ -1852,7 +1922,6 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
         uint64 r_size  = parse_hex(parts[1]);
         if (r_start == 0 || r_size == 0 || r_size > 64 * 1024 * 1024) continue;
 
-        // Read the region (cap per-region read at 16 MB to avoid stalls)
         uint read_sz = uint(r_size < 16 * 1024 * 1024 ? r_size : 16 * 1024 * 1024);
         array<uint8> data;
         g_proc.rvm(r_start, read_sz, data);
@@ -1860,7 +1929,9 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
         total_regions++;
         total_bytes += data.length();
 
-        // Scan aligned at val_size steps — enough for vtable/pointer/u64 scans
+        if (total_regions % 50 == 0)
+            dbg("scan_heap_regions: scanned " + total_regions + " regions, found=" + found.length());
+
         uint scan_end = data.length() - (val_size - 1);
         for (uint i = 0; i < scan_end && found.length() < max_results; i += val_size)
         {
@@ -1895,12 +1966,10 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     res.set("bytes_scanned",   double(total_bytes));
     if (found.length() >= max_results)
         res.set("truncated", true);
+    dbg("scan_heap_regions: done. found=" + found.length() + " regions=" + total_regions + " bytes=" + total_bytes);
 }
 
 // ─── Read And Filter Pointers ────────────────────────────────────────
-// Reads `count` pointers at base + i*stride, dereferences each at deref_offset,
-// and returns only entries where the dereferenced value equals vtable_check_addr.
-// Useful for filtering player arrays by vtable without N round-trip tool calls.
 
 void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
 {
@@ -1914,6 +1983,7 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
 
     if (count == 0 || count > 2048) count = 64;
     if (stride == 0) stride = 8;
+    dbg("read_and_filter_pointers: base=" + to_hex(base) + " count=" + count + " stride=" + stride + " vtable_check=" + to_hex(vtable_check));
 
     array<dictionary@> matches;
 
@@ -1926,6 +1996,7 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
         uint64 check_val = g_proc.ru64(ptr + deref_offset);
         if (check_val != vtable_check) continue;
 
+        dbg("read_and_filter_pointers: match[" + matches.length() + "] index=" + i + " ptr=" + to_hex(ptr));
         dictionary m;
         m.set("index",       double(i));
         m.set("ptr_address", to_hex(ptr_addr));
@@ -1935,6 +2006,7 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
 
     res.set("matches", @matches);
     res.set("count",   double(matches.length()));
+    dbg("read_and_filter_pointers: done " + matches.length() + " matches");
 }
 
 // ─── Composite Tools ────────────────────────────────────────────────
@@ -1946,7 +2018,6 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
     uint dump_size = uint(get_dict_double(req, "size", 256));
     if (dump_size > 8192) dump_size = 8192;
 
-    // Options
     uint vtable_max       = uint(get_dict_double(req, "vtable_max", 16));
     bool vtable_disasm    = get_dict_bool(req, "vtable_disasm");
     uint deref_depth      = uint(get_dict_double(req, "deref_depth", 1));
@@ -1962,14 +2033,18 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
     bool include_hex_dump = get_dict_bool(req, "hex_dump");
     bool follow_pointers  = get_dict_bool(req, "follow_pointers");
 
-    // 1. Read vtable pointer
+    dbg("analyze_object: addr=" + to_hex(addr) + " size=" + dump_size + " vtable_max=" + vtable_max + " stride=" + field_stride);
+    dbg("analyze_object: skip_rtti=" + skip_rtti + " skip_vtable=" + skip_vtable + " skip_fields=" + skip_fields + " hex_dump=" + include_hex_dump);
+
     uint64 vtable_ptr = g_proc.ru64(addr);
     res.set("vtable_ptr", to_hex(vtable_ptr));
+    dbg("analyze_object: vtable_ptr=" + to_hex(vtable_ptr));
 
-    // 2. RTTI
     if (!skip_rtti && vtable_ptr > 0x10000 && g_proc.is_valid_address(vtable_ptr))
     {
+        dbg("analyze_object: reading RTTI...");
         uint64 rtti_ptr = g_proc.ru64(vtable_ptr - 8);
+        dbg("analyze_object: rtti_ptr=" + to_hex(rtti_ptr));
         if (rtti_ptr != 0 && g_proc.is_valid_address(rtti_ptr))
         {
             uint64 type_desc_ptr = g_proc.ru64(rtti_ptr + 16);
@@ -1977,12 +2052,15 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
             {
                 string class_name = g_proc.rs(type_desc_ptr + 16, 256);
                 if (class_name.length() > 0)
+                {
                     res.set("class_name", class_name);
+                    dbg("analyze_object: class_name='" + class_name + "'");
+                }
             }
 
-            // Read base class hierarchy
             int32 num_base = g_proc.r32(rtti_ptr + 8);
             uint64 base_arr_ptr = g_proc.ru64(rtti_ptr + 24);
+            dbg("analyze_object: num_base=" + num_base + " base_arr_ptr=" + to_hex(base_arr_ptr));
             if (num_base > 1 && num_base < 32 && base_arr_ptr != 0 && g_proc.is_valid_address(base_arr_ptr))
             {
                 array<string> bases;
@@ -1994,7 +2072,11 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                     if (base_td != 0 && g_proc.is_valid_address(base_td))
                     {
                         string bn = g_proc.rs(base_td + 16, 256);
-                        if (bn.length() > 0) bases.insertLast(bn);
+                        if (bn.length() > 0)
+                        {
+                            bases.insertLast(bn);
+                            dbg("analyze_object:   base[" + (b-1) + "]='" + bn + "'");
+                        }
                     }
                 }
                 if (bases.length() > 0)
@@ -2003,14 +2085,15 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
         }
     }
 
-    // 3. Vtable entries
     if (!skip_vtable && vtable_ptr > 0x10000 && g_proc.is_valid_address(vtable_ptr))
     {
+        dbg("analyze_object: enumerating vtable (max=" + vtable_max + ")...");
         array<dictionary@> vtable_entries;
         for (uint i = 0; i < vtable_max; i++)
         {
             uint64 fn = g_proc.ru64(vtable_ptr + uint64(i) * 8);
-            if (fn == 0 || !g_proc.is_valid_address(fn)) break;
+            if (fn == 0 || !g_proc.is_valid_address(fn)) { dbg("analyze_object:   vtable ends at slot " + i); break; }
+            dbg("analyze_object:   vtable[" + i + "] = " + to_hex(fn));
 
             dictionary vte;
             vte.set("index", double(i));
@@ -2032,6 +2115,7 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                         string text;
                         insts[j].get("text", text);
                         lines.insertLast(text);
+                        dbg("    " + text);
                     }
                     vte.set("disasm", lines);
                 }
@@ -2040,20 +2124,24 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
         }
         res.set("vtable", @vtable_entries);
         res.set("vtable_count", double(vtable_entries.length()));
+        dbg("analyze_object: vtable_count=" + vtable_entries.length());
     }
 
-    // 4. Optional hex dump
     if (include_hex_dump)
     {
+        dbg("analyze_object: reading hex dump...");
         array<uint8> raw;
         g_proc.rvm(addr, dump_size, raw);
         if (raw.length() > 0)
+        {
             res.set("hex", bytes_to_hex(raw));
+            dbg("analyze_object: hex dump " + raw.length() + " bytes");
+        }
     }
 
-    // 5. Classify fields
     if (!skip_fields)
     {
+        dbg("analyze_object: classifying fields (stride=" + field_stride + " count=" + (dump_size/field_stride) + ")...");
         array<dictionary@> fields;
         for (uint off = field_offset; off < dump_size; off += field_stride)
         {
@@ -2065,6 +2153,7 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
             if (val == 0)
             {
                 field.set("type", "null");
+                dbg("  +0x" + to_hex(uint64(off)) + " [null]");
             }
             else if (val > 0x10000 && val < 0x7FFFFFFFFFFF && g_proc.is_valid_address(val))
             {
@@ -2077,8 +2166,8 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                     field.set("type", "pointer_leaf");
 
                 field.set("deref", to_hex(deref));
+                dbg("  +0x" + to_hex(uint64(off)) + " [ptr] " + to_hex(val) + " -> " + to_hex(deref));
 
-                // String detection
                 if (read_strings)
                 {
                     uint8 b0 = g_proc.ru8(val);
@@ -2086,7 +2175,10 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                     {
                         string s = g_proc.rs(val, string_max);
                         if (s.length() >= 2)
+                        {
                             field.set("as_string", s);
+                            dbg("    as_string='" + s.substr(0, 64) + "'");
+                        }
                     }
                 }
                 if (read_wstrings)
@@ -2096,11 +2188,13 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                     {
                         string ws_val = g_proc.rws(val, string_max);
                         if (ws_val.length() >= 2)
+                        {
                             field.set("as_wstring", ws_val);
+                            dbg("    as_wstring='" + ws_val.substr(0, 64) + "'");
+                        }
                     }
                 }
 
-                // Follow pointers deeper
                 if (follow_pointers && deref_valid && deref_depth > 1)
                 {
                     array<string> chain;
@@ -2117,7 +2211,6 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                         field.set("pointer_chain", chain);
                 }
 
-                // Try RTTI on sub-objects (if deref looks like a vtable)
                 if (follow_pointers && deref_valid)
                 {
                     uint64 sub_vtable = g_proc.ru64(val);
@@ -2131,7 +2224,10 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                             {
                                 string cn = g_proc.rs(sub_td + 16, 128);
                                 if (cn.length() > 0)
+                                {
                                     field.set("rtti_name", cn);
+                                    dbg("    rtti_name='" + cn + "'");
+                                }
                             }
                         }
                     }
@@ -2148,15 +2244,18 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
                 {
                     field.set("type", "float_or_int");
                     field.set("as_float", double(f));
+                    dbg("  +0x" + to_hex(uint64(off)) + " [float] " + f);
                 }
                 else if (likely_double)
                 {
                     field.set("type", "double_or_int");
                     field.set("as_double", d);
+                    dbg("  +0x" + to_hex(uint64(off)) + " [double] " + d);
                 }
                 else
                 {
                     field.set("type", "integer");
+                    dbg("  +0x" + to_hex(uint64(off)) + " [int] " + to_hex(val));
                 }
                 field.set("as_u32", double(uint(val & 0xFFFFFFFF)));
                 field.set("as_i32", double(int(val & 0xFFFFFFFF)));
@@ -2165,13 +2264,16 @@ void cmd_analyze_object(dictionary &in req, dictionary &inout res)
         }
         res.set("fields", @fields);
         res.set("field_count", double(fields.length()));
+        dbg("analyze_object: field_count=" + fields.length());
     }
+    dbg("analyze_object: done");
 }
 
 // ─── Batch Command Handler ──────────────────────────────────────────
 
 void dispatch_command(const string &in cmd, dictionary &in req, dictionary &inout res)
 {
+    dbg("dispatch: '" + cmd + "'");
     if      (cmd == "attach")              cmd_attach(req, res);
     else if (cmd == "detach")              cmd_detach(res);
     else if (cmd == "process_info")        cmd_process_info(res);
@@ -2218,7 +2320,11 @@ void dispatch_command(const string &in cmd, dictionary &in req, dictionary &inou
     else if (cmd == "cs2_schema_dump")     cmd_cs2_schema_dump(res);
     else if (cmd == "analyze_object")      cmd_analyze_object(req, res);
     else
+    {
+        dbg("dispatch: UNKNOWN command '" + cmd + "'");
         res.set("error", "unknown command: " + cmd);
+    }
+    dbg("dispatch: '" + cmd + "' done");
 }
 
 void cmd_batch(dictionary &in req, dictionary &inout res)
@@ -2229,18 +2335,21 @@ void cmd_batch(dictionary &in req, dictionary &inout res)
         res.set("error", "batch requires 'commands' array");
         return;
     }
+    dbg("batch: " + commands.length() + " commands");
 
     array<dictionary@> results;
     for (uint i = 0; i < commands.length(); i++)
     {
         if (commands[i] is null) continue;
         string sub_cmd = get_dict_string(commands[i], "cmd");
+        dbg("batch[" + i + "]: '" + sub_cmd + "'");
         dictionary sub_res;
         dispatch_command(sub_cmd, commands[i], sub_res);
         results.insertLast(@sub_res);
     }
     res.set("results", @results);
     res.set("count", double(results.length()));
+    dbg("batch: done " + results.length() + " results");
 }
 
 // ─── Request Router ──────────────────────────────────────────────────
@@ -2248,10 +2357,11 @@ void cmd_batch(dictionary &in req, dictionary &inout res)
 void handle_request(dictionary &in req)
 {
     string cmd;
-    if (!req.get("cmd", cmd)) return;
+    if (!req.get("cmd", cmd)) { dbg("handle_request: missing 'cmd' field"); return; }
 
     string req_id;
     req.get("_id", req_id);
+    dbg("handle_request: cmd='" + cmd + "' id='" + req_id + "'");
 
     dictionary res;
     if (req_id != "")
@@ -2263,13 +2373,13 @@ void handle_request(dictionary &in req)
         dispatch_command(cmd, req, res);
 
     send_response(res);
+    dbg("handle_request: response sent for '" + cmd + "'");
 }
 
 // ─── WebSocket Pump ──────────────────────────────────────────────────
 
-// Ticks since last outbound message — used to throttle keepalive pings
 int g_idle_ticks = 0;
-const int KEEPALIVE_INTERVAL = 30; // seconds (callback fires at ~1Hz)
+const int KEEPALIVE_INTERVAL = 30;
 
 void do_disconnect(const string &in reason)
 {
@@ -2283,7 +2393,6 @@ void do_disconnect(const string &in reason)
 
 void ws_pump()
 {
-    // Detect silent drops: socket closed without a clean WS close frame
     if (!g_ws.is_open())
     {
         do_disconnect("Connection lost (silent drop)");
@@ -2298,15 +2407,18 @@ void ws_pump()
     {
         if (is_text)
         {
-            // Swallow hub pings ({"_hub_ping":true}) — no response needed
             if (msg.findFirst("_hub_ping") >= 0) { g_idle_ticks = 0; break; }
 
+            dbg("RECV: " + msg.substr(0, 200) + (msg.length() > 200 ? "...[" + msg.length() + " chars]" : ""));
             dictionary req;
             string err;
             if (json_parse(msg, req, err))
                 handle_request(req);
             else
+            {
+                dbg("JSON parse error: " + err + " for msg: " + msg.substr(0, 100));
                 log_error("JSON parse error: " + err);
+            }
             g_idle_ticks = 0;
         }
         if (is_closed) break;
@@ -2318,8 +2430,6 @@ void ws_pump()
         return;
     }
 
-    // Keepalive: send a no-op ping every KEEPALIVE_INTERVAL idle seconds.
-    // The hub ignores messages without _id, so this is a free heartbeat.
     g_idle_ticks++;
     if (g_idle_ticks >= KEEPALIVE_INTERVAL)
     {
@@ -2336,16 +2446,15 @@ void try_connect()
         g_connected = true;
         g_idle_ticks = 0;
         g_retry_count = 0;
-        log_console("[RE Server] Connected to MCP server. RE tools available.");
+        log_console("[RE Server DEBUG] Connected to MCP server. RE tools available + DEBUG logging ON.");
     }
     else
     {
         g_ws.close();
         g_ws = ws_t();
         g_retry_count++;
-        // Log every 10 retries to avoid spam (callback fires every ~1s)
         if (g_retry_count == 1 || g_retry_count % 10 == 0)
-            log_console("[RE Server] Waiting for MCP server... (attempt " + g_retry_count + ")");
+            log_console("[RE Server DEBUG] Waiting for MCP server... (attempt " + g_retry_count + ")");
     }
 }
 
@@ -2361,19 +2470,17 @@ void ws_callback(int, int)
 
 int main()
 {
-    log_console("[RE Server] Starting Perception RE server (background mode)...");
-    log_console("[RE Server] Will keep looking for MCP at ws://127.0.0.1:9001");
+    log_console("[RE Server DEBUG] Starting — ALL operations will be printed to console.");
+    log_console("[RE Server DEBUG] Will connect to ws://127.0.0.1:9001");
 
     g_callback_id = register_callback(ws_callback, 1, 0);
     if (g_callback_id == 0)
     {
-        log_error("[RE Server] Failed to register callback");
+        log_error("[RE Server DEBUG] Failed to register callback");
         return -1;
     }
 
-    // Try connecting immediately
     try_connect();
-
     return 1;
 }
 
@@ -2391,5 +2498,5 @@ void on_unload()
     g_proc = proc_t();
 
     g_attached = false;
-    log_console("[RE Server] Unloaded");
+    log_console("[RE Server DEBUG] Unloaded");
 }

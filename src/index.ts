@@ -715,7 +715,7 @@ server.tool(
   { search_text: z.string().describe("Text to search for in strings"),
     module_name: z.string().optional().describe("Module to search (default: main)") },
   async (params) => {
-    const res = await callTool("find_string_refs", params, 120000);
+    const res = await callTool("find_string_refs", params, 180000);
     return { content: [{ type: "text", text: res }] };
   }
 );
