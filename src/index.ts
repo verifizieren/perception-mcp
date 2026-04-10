@@ -2,7 +2,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { WebSocketServer, WebSocket } from "ws";
-import * as net from "net";
 
 // ─── WebSocket Bridge (multi-instance safe) ──────────────────────────
 //
@@ -29,22 +28,35 @@ let relayClients = new Map<string, WebSocket>(); // instanceId -> ws
 // Relay state
 let hubConnection: WebSocket | null = null;
 
-// ─── Check if port is available ──────────────────────────────────────
-function isPortFree(port: number): Promise<boolean> {
+// ─── Hub Mode (first instance) ──────────────────────────────────────
+// Tries to bind the WS server directly. Resolves true on success, false
+// if EADDRINUSE. Eliminates the TOCTOU race of a separate "is port free"
+// probe, which can race with TIME_WAIT sockets and other relays.
+function tryStartHub(): Promise<boolean> {
   return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.once("error", () => resolve(false));
-    srv.once("listening", () => { srv.close(); resolve(true); });
-    srv.listen(port, "127.0.0.1");
+    const wss = new WebSocketServer({ port: WS_PORT });
+
+    const onError = (err: any) => {
+      if (err && err.code === "EADDRINUSE") {
+        resolve(false);
+      } else {
+        console.error("[perception-mcp] Hub listen error:", err);
+        resolve(false);
+      }
+    };
+    wss.once("error", onError);
+
+    wss.once("listening", () => {
+      wss.removeListener("error", onError);
+      isHub = true;
+      console.error(`[perception-mcp] HUB mode — WebSocket server on ws://127.0.0.1:${WS_PORT}`);
+      attachHubHandlers(wss);
+      resolve(true);
+    });
   });
 }
 
-// ─── Hub Mode (first instance) ──────────────────────────────────────
-function startHub() {
-  isHub = true;
-  const wss = new WebSocketServer({ port: WS_PORT });
-  console.error(`[perception-mcp] HUB mode — WebSocket server on ws://127.0.0.1:${WS_PORT}`);
-
+function attachHubHandlers(wss: WebSocketServer) {
   wss.on("connection", (ws) => {
     let clientType: "unknown" | "perception" | "relay" = "unknown";
     let relayId = "";
@@ -93,6 +105,16 @@ function startHub() {
         }
 
         if (clientType === "perception") {
+          // Handle process lifecycle events from auto-detach/reattach
+          if (msg._event) {
+            if (msg._event === "process_died") {
+              console.error(`[perception-mcp] Process died: ${msg.name} (PID ${msg.pid}) — auto-detached, waiting for reattach...`);
+            } else if (msg._event === "process_reattached") {
+              console.error(`[perception-mcp] Process reattached: ${msg.name} (PID ${msg.pid}) base=${msg.base}`);
+            }
+            return;
+          }
+
           // Response from Perception — route to correct requester
           const id: string = msg._id;
           if (!id) return; // hub pings and keepalives arrive here — silently ignored
@@ -199,10 +221,19 @@ function connectToHub() {
 
 function scheduleReconnect() {
   if (relayRetryTimer) return;
-  relayRetryTimer = setTimeout(() => {
+  // Jitter (0.5–1.5s) so two relays don't race to bind the port at the same ms.
+  const delay = 500 + Math.floor(Math.random() * 1000);
+  relayRetryTimer = setTimeout(async () => {
     relayRetryTimer = null;
+    // Before reconnecting as relay, try to promote ourselves to hub. If the
+    // previous hub died, the port is now free and someone needs to take over.
+    const becameHub = await tryStartHub();
+    if (becameHub) {
+      console.error("[perception-mcp] Promoted from RELAY to HUB");
+      return;
+    }
     connectToHub();
-  }, 3000);
+  }, delay);
 }
 
 function startRelay() {
@@ -600,7 +631,7 @@ server.tool(
     size: z.string().optional().describe("Search region size in hex"),
     module_name: z.string().optional().describe("Module to search in") },
   async (params) => {
-    const res = await callTool("find_xrefs", params, 120000);
+    const res = await callTool("find_xrefs", params, 60000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -715,7 +746,7 @@ server.tool(
   { search_text: z.string().describe("Text to search for in strings"),
     module_name: z.string().optional().describe("Module to search (default: main)") },
   async (params) => {
-    const res = await callTool("find_string_refs", params, 180000);
+    const res = await callTool("find_string_refs", params, 60000);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -883,17 +914,30 @@ server.tool(
 // ── Start Server ─────────────────────────────────────────────────────
 
 async function main() {
-  const portFree = await isPortFree(WS_PORT);
-
-  if (portFree) {
-    startHub();
-  } else {
-    startRelay();
-  }
-
+  // IMPORTANT: connect stdio FIRST so Claude's MCP handshake succeeds immediately.
+  // If we set up the WebSocket bridge first and it hangs (EADDRINUSE race with a
+  // dying previous instance, TIME_WAIT, etc.), Claude never sees the handshake
+  // response and reports "MCP error -32000: Connection closed". Tool calls that
+  // arrive before the bridge is ready will return "Perception not connected",
+  // which is a clean, recoverable error — not a broken pipe.
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[perception-mcp] MCP server running on stdio (${isHub ? "HUB" : "RELAY"} mode)`);
+  console.error("[perception-mcp] stdio transport connected");
+
+  // Now set up the WS bridge. Run it in the background so startup never blocks
+  // on networking. If tryStartHub throws or takes too long, we still survive.
+  (async () => {
+    try {
+      const becameHub = await tryStartHub();
+      if (!becameHub) {
+        startRelay();
+      }
+      console.error(`[perception-mcp] Bridge ready (${isHub ? "HUB" : "RELAY"} mode)`);
+    } catch (e) {
+      console.error("[perception-mcp] Bridge setup failed, falling back to relay:", e);
+      try { startRelay(); } catch (e2) { console.error("[perception-mcp] Relay fallback failed:", e2); }
+    }
+  })();
 }
 
 main().catch((err) => {

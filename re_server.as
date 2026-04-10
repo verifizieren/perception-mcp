@@ -10,6 +10,11 @@ int    g_callback_id = 0;
 bool   g_connected = false;
 int    g_retry_count = 0;
 
+// Auto-reattach state
+string g_last_proc_name = "";
+uint   g_last_pid = 0;
+int    g_reattach_cooldown = 0; // ticks until next reattach attempt
+
 // Memory snapshots for diff
 dictionary g_snapshots;
 
@@ -281,6 +286,9 @@ void cmd_attach(dictionary &in req, dictionary &inout res)
     }
 
     g_attached = true;
+    g_last_proc_name = name;
+    g_last_pid = g_proc.pid();
+    g_reattach_cooldown = 0;
     res.set("result", "attached");
     res.set("pid", double(g_proc.pid()));
     res.set("base", to_hex(g_proc.base_address()));
@@ -293,6 +301,9 @@ void cmd_detach(dictionary &inout res)
         g_proc.deref();
     g_proc = proc_t();
     g_attached = false;
+    g_last_proc_name = "";
+    g_last_pid = 0;
+    g_reattach_cooldown = 0;
     res.set("result", "detached");
 }
 
@@ -1000,31 +1011,27 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 target = parse_hex(get_dict_string(req, "target"));
+    if (target == 0) { res.set("error", "invalid target address"); return; }
 
     uint64 start, size;
     get_scan_region(req, start, size);
     if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
     // Search for relative 32-bit offsets (RIP-relative addressing)
-    // and absolute 64-bit pointers
+    // and absolute 64-bit pointers within the bounded module region.
+    // Uses chunk-based scanning instead of full-process scan_pointer
+    // to avoid unrecoverable exceptions.
     array<string> rel_xrefs;
     array<string> abs_xrefs;
 
-    // Scan for absolute pointer references
-    array<uint64>@ ptr_refs = g_proc.scan_pointer(target, false);
-    if (ptr_refs !is null)
-    {
-        for (uint i = 0; i < ptr_refs.length() && i < 500; i++)
-        {
-            if (ptr_refs[i] >= start && ptr_refs[i] < start + size)
-                abs_xrefs.insertLast(to_hex(ptr_refs[i]));
-        }
-    }
+    // Encode target as 8 little-endian bytes for absolute pointer search
+    array<uint8> target_bytes(8);
+    uint64 tmp = target;
+    for (uint b = 0; b < 8; b++) { target_bytes[b] = uint8(tmp & 0xFF); tmp >>= 8; }
 
-    // Scan for RIP-relative references (rel32 patterns)
-    // For each 4KB chunk in the region, look for rel32 that points to target
-    uint64 chunk_size = 4096;
-    for (uint64 off = 0; off < size && rel_xrefs.length() < 500; off += chunk_size)
+    // Single pass: scan for both rel32 refs and absolute pointer refs
+    uint64 chunk_size = 65536;
+    for (uint64 off = 0; off < size && (rel_xrefs.length() + abs_xrefs.length()) < 1000; off += chunk_size)
     {
         uint read_sz = uint(chunk_size < (size - off) ? chunk_size : (size - off));
         array<uint8> chunk;
@@ -1033,14 +1040,23 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
 
         for (uint i = 0; i < chunk.length() - 4; i++)
         {
-            // Read 32-bit relative offset
+            // Check rel32 reference
             int32 rel = int32(chunk[i]) | (int32(chunk[i+1]) << 8) | (int32(chunk[i+2]) << 16) | (int32(chunk[i+3]) << 24);
-            uint64 ref_addr = start + off + i + 4; // address after the rel32
+            uint64 ref_addr = start + off + i + 4;
             uint64 resolved = uint64(int64(ref_addr) + int64(rel));
             if (resolved == target)
+                rel_xrefs.insertLast(to_hex(start + off + i - 1));
+
+            // Check absolute 8-byte pointer reference
+            if (i + 8 <= chunk.length())
             {
-                // Found a relative reference, back up to find the instruction
-                rel_xrefs.insertLast(to_hex(start + off + i - 1)); // likely instruction start is 1 byte before
+                bool match = true;
+                for (uint b = 0; b < 8; b++)
+                {
+                    if (chunk[i + b] != target_bytes[b]) { match = false; break; }
+                }
+                if (match)
+                    abs_xrefs.insertLast(to_hex(start + off + i));
             }
         }
     }
@@ -1515,6 +1531,9 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
 }
 
 // ─── String References ──────────────────────────────────────────────
+// Uses bounded pattern scan + rel32 reference scanning instead of
+// full-process scan_string/scan_pointer which throw unrecoverable
+// exceptions on certain memory regions.
 
 void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 {
@@ -1522,46 +1541,81 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
     string search = get_dict_string(req, "search_text");
     if (search.length() == 0) { res.set("error", "search_text is empty"); return; }
 
-    // First find the strings in memory
-    array<uint64>@ string_addrs = g_proc.scan_string(search, false);
-    array<uint64>@ wstring_addrs = g_proc.scan_wstring(search, false);
+    // Use module-bounded scanning (safe, no full-process scan)
+    uint64 start, size;
+    get_scan_region(req, start, size);
+    if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
-    array<dictionary@> refs;
-
-    // For each found string, look for pointers to it
-    if (string_addrs !is null)
+    // Build ANSI hex pattern: "gEnv" -> "67 45 6E 76"
+    string ansi_sig = "";
+    for (uint i = 0; i < search.length(); i++)
     {
-        for (uint i = 0; i < string_addrs.length() && i < 20; i++)
-        {
-            array<uint64>@ ptrs = g_proc.scan_pointer(string_addrs[i], false);
-            if (ptrs !is null)
-            {
-                for (uint j = 0; j < ptrs.length() && j < 50; j++)
-                {
-                    dictionary r;
-                    r.set("string_address", to_hex(string_addrs[i]));
-                    r.set("ref_address", to_hex(ptrs[j]));
-                    r.set("type", "ansi");
-                    refs.insertLast(@r);
-                }
-            }
-        }
+        if (i > 0) ansi_sig += " ";
+        uint8 c = search[i];
+        ansi_sig += HEX_UPPER.substr((c >> 4) & 0xF, 1) + HEX_UPPER.substr(c & 0xF, 1);
     }
 
-    if (wstring_addrs !is null)
+    // Build wide (UTF-16LE) hex pattern: "gEnv" -> "67 00 45 00 6E 00 76 00"
+    string wide_sig = "";
+    for (uint i = 0; i < search.length(); i++)
     {
-        for (uint i = 0; i < wstring_addrs.length() && i < 20; i++)
+        if (i > 0) wide_sig += " ";
+        uint8 c = search[i];
+        wide_sig += HEX_UPPER.substr((c >> 4) & 0xF, 1) + HEX_UPPER.substr(c & 0xF, 1) + " 00";
+    }
+
+    // Find string occurrences in module range (bounded, safe)
+    array<uint64> ansi_addrs;
+    g_proc.find_all_code_patterns(start, size, ansi_sig, ansi_addrs);
+
+    array<uint64> wide_addrs;
+    g_proc.find_all_code_patterns(start, size, wide_sig, wide_addrs);
+
+    // Collect targets for reference scan (limit to avoid slow scans)
+    array<uint64> all_targets;
+    array<string> all_types;
+    uint ansi_limit = ansi_addrs.length() < 10 ? ansi_addrs.length() : 10;
+    for (uint i = 0; i < ansi_limit; i++)
+    {
+        all_targets.insertLast(ansi_addrs[i]);
+        all_types.insertLast("ansi");
+    }
+    uint wide_limit = wide_addrs.length() < 10 ? wide_addrs.length() : 10;
+    for (uint i = 0; i < wide_limit; i++)
+    {
+        all_targets.insertLast(wide_addrs[i]);
+        all_types.insertLast("wide");
+    }
+
+    // Single pass: scan module for RIP-relative (rel32) refs to any target
+    array<dictionary@> refs;
+    if (all_targets.length() > 0)
+    {
+        uint64 chunk_size = 65536;
+        for (uint64 off = 0; off < size && refs.length() < 500; off += chunk_size)
         {
-            array<uint64>@ ptrs = g_proc.scan_pointer(wstring_addrs[i], false);
-            if (ptrs !is null)
+            uint read_sz = uint(chunk_size < (size - off) ? chunk_size : (size - off));
+            array<uint8> chunk;
+            g_proc.rvm(start + off, read_sz, chunk);
+            if (chunk.length() < 5) continue;
+
+            for (uint i = 0; i < chunk.length() - 4; i++)
             {
-                for (uint j = 0; j < ptrs.length() && j < 50; j++)
+                int32 rel = int32(chunk[i]) | (int32(chunk[i+1]) << 8) | (int32(chunk[i+2]) << 16) | (int32(chunk[i+3]) << 24);
+                uint64 ref_addr = start + off + i + 4;
+                uint64 resolved = uint64(int64(ref_addr) + int64(rel));
+
+                for (uint t = 0; t < all_targets.length(); t++)
                 {
-                    dictionary r;
-                    r.set("string_address", to_hex(wstring_addrs[i]));
-                    r.set("ref_address", to_hex(ptrs[j]));
-                    r.set("type", "wide");
-                    refs.insertLast(@r);
+                    if (resolved == all_targets[t])
+                    {
+                        dictionary r;
+                        r.set("string_address", to_hex(all_targets[t]));
+                        r.set("ref_address", to_hex(start + off + i - 1));
+                        r.set("type", all_types[t]);
+                        refs.insertLast(@r);
+                        break;
+                    }
                 }
             }
         }
@@ -1569,6 +1623,10 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 
     res.set("references", @refs);
     res.set("count", double(refs.length()));
+    res.set("ansi_strings_found", double(ansi_addrs.length()));
+    res.set("wide_strings_found", double(wide_addrs.length()));
+    res.set("scan_region", to_hex(start));
+    res.set("scan_size", to_hex(size));
 }
 
 // ─── Unicorn Emulation ──────────────────────────────────────────────
@@ -2349,8 +2407,72 @@ void try_connect()
     }
 }
 
+void check_process_alive()
+{
+    if (!g_attached) return;
+
+    if (!g_proc.alive())
+    {
+        // Process died (crash, exit, etc.) — clean up
+        log_console("[RE Server] Process died (PID " + g_last_pid + ") — auto-detached.");
+        g_proc.deref();
+        g_proc = proc_t();
+        g_attached = false;
+        g_snapshots.deleteAll();
+        g_reattach_cooldown = 5; // wait 5s before trying to reattach
+
+        // Notify MCP side if connected
+        if (g_connected && g_ws.is_open())
+        {
+            string notify = "{\"_event\":\"process_died\",\"pid\":" + g_last_pid + ",\"name\":\"" + mcp_json_escape(g_last_proc_name) + "\"}";
+            g_ws.send_text(notify);
+        }
+        return;
+    }
+}
+
+void try_reattach()
+{
+    // Only reattach if we have a name to reattach to and aren't already attached
+    if (g_attached || g_last_proc_name == "") return;
+
+    if (g_reattach_cooldown > 0) { g_reattach_cooldown--; return; }
+
+    // Try to find the process again
+    proc_t p = ref_process(g_last_proc_name);
+    if (p.alive())
+    {
+        // Don't reattach to the same dying PID
+        if (p.pid() != g_last_pid || g_last_pid == 0)
+        {
+            g_proc = p;
+            g_attached = true;
+            g_last_pid = g_proc.pid();
+            log_console("[RE Server] Auto-reattached to " + g_last_proc_name + " (PID " + g_last_pid + ")");
+
+            if (g_connected && g_ws.is_open())
+            {
+                string notify = "{\"_event\":\"process_reattached\",\"pid\":" + g_last_pid + ",\"name\":\"" + mcp_json_escape(g_last_proc_name) + "\",\"base\":\"" + to_hex(g_proc.base_address()) + "\"}";
+                g_ws.send_text(notify);
+            }
+            return;
+        }
+        p.deref();
+    }
+
+    // Process not found yet, try again in 3 seconds
+    g_reattach_cooldown = 3;
+}
+
 void ws_callback(int, int)
 {
+    // Check if attached process is still alive (auto-detach on crash)
+    check_process_alive();
+
+    // Try to reattach if process died and we have a name
+    if (!g_attached && g_last_proc_name != "")
+        try_reattach();
+
     if (g_connected)
         ws_pump();
     else
