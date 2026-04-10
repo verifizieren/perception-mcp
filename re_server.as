@@ -10,11 +10,6 @@ int    g_callback_id = 0;
 bool   g_connected = false;
 int    g_retry_count = 0;
 
-// Auto-reattach state
-string g_last_proc_name = "";
-uint   g_last_pid = 0;
-int    g_reattach_cooldown = 0; // ticks until next reattach attempt
-
 // Memory snapshots for diff
 dictionary g_snapshots;
 
@@ -286,9 +281,6 @@ void cmd_attach(dictionary &in req, dictionary &inout res)
     }
 
     g_attached = true;
-    g_last_proc_name = name;
-    g_last_pid = g_proc.pid();
-    g_reattach_cooldown = 0;
     res.set("result", "attached");
     res.set("pid", double(g_proc.pid()));
     res.set("base", to_hex(g_proc.base_address()));
@@ -301,9 +293,6 @@ void cmd_detach(dictionary &inout res)
         g_proc.deref();
     g_proc = proc_t();
     g_attached = false;
-    g_last_proc_name = "";
-    g_last_pid = 0;
-    g_reattach_cooldown = 0;
     res.set("result", "detached");
 }
 
@@ -942,26 +931,26 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
     string type = get_dict_string(req, "type");
     bool heap_only = get_dict_bool(req, "heap_only");
 
-    // Value can arrive as double or string from JSON
-    double num_val = get_dict_double(req, "value", 0);
-    string str_val = get_dict_string(req, "value", "");
-
     array<uint64>@ results;
     if (type == "u32")
     {
-        @results = g_proc.scan_u32(uint(num_val), heap_only);
+        double v; req.get("value", v);
+        @results = g_proc.scan_u32(uint(v), heap_only);
     }
     else if (type == "u64")
     {
-        @results = g_proc.scan_u64(parse_hex(str_val), heap_only);
+        string v = get_dict_string(req, "value");
+        @results = g_proc.scan_u64(parse_hex(v), heap_only);
     }
     else if (type == "float")
     {
-        @results = g_proc.scan_float(float(num_val), heap_only);
+        double v; req.get("value", v);
+        @results = g_proc.scan_float(float(v), heap_only);
     }
     else if (type == "double")
     {
-        @results = g_proc.scan_double(num_val, heap_only);
+        double v; req.get("value", v);
+        @results = g_proc.scan_double(v, heap_only);
     }
     else if (type == "string")
     {
@@ -1011,27 +1000,31 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 target = parse_hex(get_dict_string(req, "target"));
-    if (target == 0) { res.set("error", "invalid target address"); return; }
 
     uint64 start, size;
     get_scan_region(req, start, size);
     if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
     // Search for relative 32-bit offsets (RIP-relative addressing)
-    // and absolute 64-bit pointers within the bounded module region.
-    // Uses chunk-based scanning instead of full-process scan_pointer
-    // to avoid unrecoverable exceptions.
+    // and absolute 64-bit pointers
     array<string> rel_xrefs;
     array<string> abs_xrefs;
 
-    // Encode target as 8 little-endian bytes for absolute pointer search
-    array<uint8> target_bytes(8);
-    uint64 tmp = target;
-    for (uint b = 0; b < 8; b++) { target_bytes[b] = uint8(tmp & 0xFF); tmp >>= 8; }
+    // Scan for absolute pointer references
+    array<uint64>@ ptr_refs = g_proc.scan_pointer(target, false);
+    if (ptr_refs !is null)
+    {
+        for (uint i = 0; i < ptr_refs.length() && i < 500; i++)
+        {
+            if (ptr_refs[i] >= start && ptr_refs[i] < start + size)
+                abs_xrefs.insertLast(to_hex(ptr_refs[i]));
+        }
+    }
 
-    // Single pass: scan for both rel32 refs and absolute pointer refs
-    uint64 chunk_size = 65536;
-    for (uint64 off = 0; off < size && (rel_xrefs.length() + abs_xrefs.length()) < 1000; off += chunk_size)
+    // Scan for RIP-relative references (rel32 patterns)
+    // For each 4KB chunk in the region, look for rel32 that points to target
+    uint64 chunk_size = 4096;
+    for (uint64 off = 0; off < size && rel_xrefs.length() < 500; off += chunk_size)
     {
         uint read_sz = uint(chunk_size < (size - off) ? chunk_size : (size - off));
         array<uint8> chunk;
@@ -1040,23 +1033,14 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
 
         for (uint i = 0; i < chunk.length() - 4; i++)
         {
-            // Check rel32 reference
+            // Read 32-bit relative offset
             int32 rel = int32(chunk[i]) | (int32(chunk[i+1]) << 8) | (int32(chunk[i+2]) << 16) | (int32(chunk[i+3]) << 24);
-            uint64 ref_addr = start + off + i + 4;
+            uint64 ref_addr = start + off + i + 4; // address after the rel32
             uint64 resolved = uint64(int64(ref_addr) + int64(rel));
             if (resolved == target)
-                rel_xrefs.insertLast(to_hex(start + off + i - 1));
-
-            // Check absolute 8-byte pointer reference
-            if (i + 8 <= chunk.length())
             {
-                bool match = true;
-                for (uint b = 0; b < 8; b++)
-                {
-                    if (chunk[i + b] != target_bytes[b]) { match = false; break; }
-                }
-                if (match)
-                    abs_xrefs.insertLast(to_hex(start + off + i));
+                // Found a relative reference, back up to find the instruction
+                rel_xrefs.insertLast(to_hex(start + off + i - 1)); // likely instruction start is 1 byte before
             }
         }
     }
@@ -1506,7 +1490,6 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 target    = parse_hex(get_dict_string(req, "target"));
-    if (target == 0) { res.set("error", "invalid target address (got 0)"); return; }
     bool   heap_only = get_dict_bool(req, "heap_only");
     uint   page_offset = uint(get_dict_double(req, "page_offset", 0));
     uint   page_limit  = uint(get_dict_double(req, "page_limit",  1000));
@@ -1531,91 +1514,52 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
 }
 
 // ─── String References ──────────────────────────────────────────────
-// Uses bounded pattern scan + rel32 reference scanning instead of
-// full-process scan_string/scan_pointer which throw unrecoverable
-// exceptions on certain memory regions.
 
 void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string search = get_dict_string(req, "search_text");
-    if (search.length() == 0) { res.set("error", "search_text is empty"); return; }
 
-    // Use module-bounded scanning (safe, no full-process scan)
-    uint64 start, size;
-    get_scan_region(req, start, size);
-    if (size == 0) { res.set("error", "could not determine scan region"); return; }
+    // First find the strings in memory
+    array<uint64>@ string_addrs = g_proc.scan_string(search, false);
+    array<uint64>@ wstring_addrs = g_proc.scan_wstring(search, false);
 
-    // Build ANSI hex pattern: "gEnv" -> "67 45 6E 76"
-    string ansi_sig = "";
-    for (uint i = 0; i < search.length(); i++)
-    {
-        if (i > 0) ansi_sig += " ";
-        uint8 c = search[i];
-        ansi_sig += HEX_UPPER.substr((c >> 4) & 0xF, 1) + HEX_UPPER.substr(c & 0xF, 1);
-    }
-
-    // Build wide (UTF-16LE) hex pattern: "gEnv" -> "67 00 45 00 6E 00 76 00"
-    string wide_sig = "";
-    for (uint i = 0; i < search.length(); i++)
-    {
-        if (i > 0) wide_sig += " ";
-        uint8 c = search[i];
-        wide_sig += HEX_UPPER.substr((c >> 4) & 0xF, 1) + HEX_UPPER.substr(c & 0xF, 1) + " 00";
-    }
-
-    // Find string occurrences in module range (bounded, safe)
-    array<uint64> ansi_addrs;
-    g_proc.find_all_code_patterns(start, size, ansi_sig, ansi_addrs);
-
-    array<uint64> wide_addrs;
-    g_proc.find_all_code_patterns(start, size, wide_sig, wide_addrs);
-
-    // Collect targets for reference scan (limit to avoid slow scans)
-    array<uint64> all_targets;
-    array<string> all_types;
-    uint ansi_limit = ansi_addrs.length() < 10 ? ansi_addrs.length() : 10;
-    for (uint i = 0; i < ansi_limit; i++)
-    {
-        all_targets.insertLast(ansi_addrs[i]);
-        all_types.insertLast("ansi");
-    }
-    uint wide_limit = wide_addrs.length() < 10 ? wide_addrs.length() : 10;
-    for (uint i = 0; i < wide_limit; i++)
-    {
-        all_targets.insertLast(wide_addrs[i]);
-        all_types.insertLast("wide");
-    }
-
-    // Single pass: scan module for RIP-relative (rel32) refs to any target
     array<dictionary@> refs;
-    if (all_targets.length() > 0)
+
+    // For each found string, look for pointers to it
+    if (string_addrs !is null)
     {
-        uint64 chunk_size = 65536;
-        for (uint64 off = 0; off < size && refs.length() < 500; off += chunk_size)
+        for (uint i = 0; i < string_addrs.length() && i < 20; i++)
         {
-            uint read_sz = uint(chunk_size < (size - off) ? chunk_size : (size - off));
-            array<uint8> chunk;
-            g_proc.rvm(start + off, read_sz, chunk);
-            if (chunk.length() < 5) continue;
-
-            for (uint i = 0; i < chunk.length() - 4; i++)
+            array<uint64>@ ptrs = g_proc.scan_pointer(string_addrs[i], false);
+            if (ptrs !is null)
             {
-                int32 rel = int32(chunk[i]) | (int32(chunk[i+1]) << 8) | (int32(chunk[i+2]) << 16) | (int32(chunk[i+3]) << 24);
-                uint64 ref_addr = start + off + i + 4;
-                uint64 resolved = uint64(int64(ref_addr) + int64(rel));
-
-                for (uint t = 0; t < all_targets.length(); t++)
+                for (uint j = 0; j < ptrs.length() && j < 50; j++)
                 {
-                    if (resolved == all_targets[t])
-                    {
-                        dictionary r;
-                        r.set("string_address", to_hex(all_targets[t]));
-                        r.set("ref_address", to_hex(start + off + i - 1));
-                        r.set("type", all_types[t]);
-                        refs.insertLast(@r);
-                        break;
-                    }
+                    dictionary r;
+                    r.set("string_address", to_hex(string_addrs[i]));
+                    r.set("ref_address", to_hex(ptrs[j]));
+                    r.set("type", "ansi");
+                    refs.insertLast(@r);
+                }
+            }
+        }
+    }
+
+    if (wstring_addrs !is null)
+    {
+        for (uint i = 0; i < wstring_addrs.length() && i < 20; i++)
+        {
+            array<uint64>@ ptrs = g_proc.scan_pointer(wstring_addrs[i], false);
+            if (ptrs !is null)
+            {
+                for (uint j = 0; j < ptrs.length() && j < 50; j++)
+                {
+                    dictionary r;
+                    r.set("string_address", to_hex(wstring_addrs[i]));
+                    r.set("ref_address", to_hex(ptrs[j]));
+                    r.set("type", "wide");
+                    refs.insertLast(@r);
                 }
             }
         }
@@ -1623,10 +1567,6 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 
     res.set("references", @refs);
     res.set("count", double(refs.length()));
-    res.set("ansi_strings_found", double(ansi_addrs.length()));
-    res.set("wide_strings_found", double(wide_addrs.length()));
-    res.set("scan_region", to_hex(start));
-    res.set("scan_size", to_hex(size));
 }
 
 // ─── Unicorn Emulation ──────────────────────────────────────────────
@@ -1660,16 +1600,13 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     }
     uc_mem_write(uc, map_addr, code);
 
-    // Setup stack (uc_setup_stack maps stack + stop page internally)
+    // Setup stack
     uint64 stack_base = 0x100000;
     uint64 stack_size = 0x10000;
     uint64 stop_addr = 0xDEAD0000;
-    if (!uc_setup_stack(uc, stack_base, stack_size, stop_addr))
-    {
-        uc_close(uc);
-        res.set("error", "uc_setup_stack failed");
-        return;
-    }
+    uc_mem_map(uc, stack_base, stack_size, UC_PROT_ALL);
+    uc_mem_map(uc, stop_addr & ~0xFFF, 0x1000, UC_PROT_ALL);
+    uc_setup_stack(uc, stack_base, stack_size, stop_addr);
 
     // Map additional regions if requested
     array<dictionary@>@ map_regions;
@@ -1729,11 +1666,14 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
 
     // Execute
     uint64 start_addr = map_addr + entry_offset;
-    bool emu_ok = uc_start(uc, start_addr, stop_addr, 0, max_insts) != 0;
+    int emu_result = uc_start(uc, start_addr, stop_addr, 0, max_insts);
 
-    res.set("success", emu_ok);
+    res.set("emu_result", double(emu_result));
 
     // Read output registers
+    array<string> read_regs;
+    array<dictionary@>@ read_regs_raw;
+    // Default: read rax
     dictionary reg_out;
     reg_out.set("rax", to_hex(uc_reg_read64(uc, UC_X86_REG_RAX)));
     reg_out.set("rbx", to_hex(uc_reg_read64(uc, UC_X86_REG_RBX)));
@@ -1746,11 +1686,9 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     reg_out.set("rip", to_hex(uc_reg_read64(uc, UC_X86_REG_RIP)));
     res.set("registers", @reg_out);
 
-    // Always check exception state
-    int exc = uc_get_last_exception(uc);
-    if (exc != 0)
+    if (emu_result != 0)
     {
-        res.set("exception", double(exc));
+        res.set("exception", double(uc_get_last_exception(uc)));
         res.set("exception_address", to_hex(uc_get_exception_address(uc)));
     }
 
@@ -1995,241 +1933,20 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
     res.set("count",   double(matches.length()));
 }
 
-// ─── Composite Tools ────────────────────────────────────────────────
+// ─── Request Router ──────────────────────────────────────────────────
 
-void cmd_analyze_object(dictionary &in req, dictionary &inout res)
+void handle_request(dictionary &in req)
 {
-    if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
-    uint64 addr = parse_hex(get_dict_string(req, "address"));
-    uint dump_size = uint(get_dict_double(req, "size", 256));
-    if (dump_size > 8192) dump_size = 8192;
+    string cmd;
+    if (!req.get("cmd", cmd)) return;
 
-    // Options
-    uint vtable_max       = uint(get_dict_double(req, "vtable_max", 16));
-    bool vtable_disasm    = get_dict_bool(req, "vtable_disasm");
-    uint deref_depth      = uint(get_dict_double(req, "deref_depth", 1));
-    uint field_stride     = uint(get_dict_double(req, "stride", 8));
-    if (field_stride != 4 && field_stride != 8) field_stride = 8;
-    bool read_strings     = get_dict_bool(req, "read_strings", true);
-    bool read_wstrings    = get_dict_bool(req, "read_wstrings");
-    uint string_max       = uint(get_dict_double(req, "string_max", 128));
-    bool skip_rtti        = get_dict_bool(req, "skip_rtti");
-    bool skip_vtable      = get_dict_bool(req, "skip_vtable");
-    bool skip_fields      = get_dict_bool(req, "skip_fields");
-    uint field_offset     = uint(get_dict_double(req, "field_offset", 0));
-    bool include_hex_dump = get_dict_bool(req, "hex_dump");
-    bool follow_pointers  = get_dict_bool(req, "follow_pointers");
+    string req_id;
+    req.get("_id", req_id);
 
-    // 1. Read vtable pointer
-    uint64 vtable_ptr = g_proc.ru64(addr);
-    res.set("vtable_ptr", to_hex(vtable_ptr));
+    dictionary res;
+    if (req_id != "")
+        res.set("_id", req_id);
 
-    // 2. RTTI
-    if (!skip_rtti && vtable_ptr > 0x10000 && g_proc.is_valid_address(vtable_ptr))
-    {
-        uint64 rtti_ptr = g_proc.ru64(vtable_ptr - 8);
-        if (rtti_ptr != 0 && g_proc.is_valid_address(rtti_ptr))
-        {
-            uint64 type_desc_ptr = g_proc.ru64(rtti_ptr + 16);
-            if (type_desc_ptr != 0 && g_proc.is_valid_address(type_desc_ptr))
-            {
-                string class_name = g_proc.rs(type_desc_ptr + 16, 256);
-                if (class_name.length() > 0)
-                    res.set("class_name", class_name);
-            }
-
-            // Read base class hierarchy
-            int32 num_base = g_proc.r32(rtti_ptr + 8);
-            uint64 base_arr_ptr = g_proc.ru64(rtti_ptr + 24);
-            if (num_base > 1 && num_base < 32 && base_arr_ptr != 0 && g_proc.is_valid_address(base_arr_ptr))
-            {
-                array<string> bases;
-                for (int b = 1; b < num_base; b++)
-                {
-                    uint64 base_desc = g_proc.ru64(base_arr_ptr + uint64(b) * 8);
-                    if (base_desc == 0 || !g_proc.is_valid_address(base_desc)) break;
-                    uint64 base_td = g_proc.ru64(base_desc);
-                    if (base_td != 0 && g_proc.is_valid_address(base_td))
-                    {
-                        string bn = g_proc.rs(base_td + 16, 256);
-                        if (bn.length() > 0) bases.insertLast(bn);
-                    }
-                }
-                if (bases.length() > 0)
-                    res.set("base_classes", bases);
-            }
-        }
-    }
-
-    // 3. Vtable entries
-    if (!skip_vtable && vtable_ptr > 0x10000 && g_proc.is_valid_address(vtable_ptr))
-    {
-        array<dictionary@> vtable_entries;
-        for (uint i = 0; i < vtable_max; i++)
-        {
-            uint64 fn = g_proc.ru64(vtable_ptr + uint64(i) * 8);
-            if (fn == 0 || !g_proc.is_valid_address(fn)) break;
-
-            dictionary vte;
-            vte.set("index", double(i));
-            vte.set("address", to_hex(fn));
-
-            if (vtable_disasm)
-            {
-                array<uint8> code;
-                g_proc.rvm(fn, 64, code);
-                if (code.length() > 0)
-                {
-                    array<dictionary@> insts;
-                    zydis_disasm(code, fn, insts);
-                    uint limit = insts.length() < 5 ? insts.length() : 5;
-                    array<string> lines;
-                    for (uint j = 0; j < limit; j++)
-                    {
-                        if (insts[j] is null) continue;
-                        string text;
-                        insts[j].get("text", text);
-                        lines.insertLast(text);
-                    }
-                    vte.set("disasm", lines);
-                }
-            }
-            vtable_entries.insertLast(@vte);
-        }
-        res.set("vtable", @vtable_entries);
-        res.set("vtable_count", double(vtable_entries.length()));
-    }
-
-    // 4. Optional hex dump
-    if (include_hex_dump)
-    {
-        array<uint8> raw;
-        g_proc.rvm(addr, dump_size, raw);
-        if (raw.length() > 0)
-            res.set("hex", bytes_to_hex(raw));
-    }
-
-    // 5. Classify fields
-    if (!skip_fields)
-    {
-        array<dictionary@> fields;
-        for (uint off = field_offset; off < dump_size; off += field_stride)
-        {
-            uint64 val = (field_stride == 8) ? g_proc.ru64(addr + off) : uint64(g_proc.ru32(addr + off));
-            dictionary field;
-            field.set("offset", to_hex(uint64(off)));
-            field.set("raw_hex", to_hex(val));
-
-            if (val == 0)
-            {
-                field.set("type", "null");
-            }
-            else if (val > 0x10000 && val < 0x7FFFFFFFFFFF && g_proc.is_valid_address(val))
-            {
-                uint64 deref = g_proc.ru64(val);
-                bool deref_valid = deref > 0x10000 && deref < 0x7FFFFFFFFFFF && g_proc.is_valid_address(deref);
-
-                if (deref_valid)
-                    field.set("type", "pointer");
-                else
-                    field.set("type", "pointer_leaf");
-
-                field.set("deref", to_hex(deref));
-
-                // String detection
-                if (read_strings)
-                {
-                    uint8 b0 = g_proc.ru8(val);
-                    if (b0 >= 0x20 && b0 < 0x7F)
-                    {
-                        string s = g_proc.rs(val, string_max);
-                        if (s.length() >= 2)
-                            field.set("as_string", s);
-                    }
-                }
-                if (read_wstrings)
-                {
-                    uint16 w0 = g_proc.ru16(val);
-                    if (w0 >= 0x20 && w0 < 0x7F00)
-                    {
-                        string ws_val = g_proc.rws(val, string_max);
-                        if (ws_val.length() >= 2)
-                            field.set("as_wstring", ws_val);
-                    }
-                }
-
-                // Follow pointers deeper
-                if (follow_pointers && deref_valid && deref_depth > 1)
-                {
-                    array<string> chain;
-                    chain.insertLast(to_hex(deref));
-                    uint64 curr = deref;
-                    for (uint d = 1; d < deref_depth; d++)
-                    {
-                        uint64 next = g_proc.ru64(curr);
-                        if (next == 0 || !g_proc.is_valid_address(next)) break;
-                        chain.insertLast(to_hex(next));
-                        curr = next;
-                    }
-                    if (chain.length() > 1)
-                        field.set("pointer_chain", chain);
-                }
-
-                // Try RTTI on sub-objects (if deref looks like a vtable)
-                if (follow_pointers && deref_valid)
-                {
-                    uint64 sub_vtable = g_proc.ru64(val);
-                    if (sub_vtable > 0x10000 && g_proc.is_valid_address(sub_vtable))
-                    {
-                        uint64 sub_rtti = g_proc.ru64(sub_vtable - 8);
-                        if (sub_rtti != 0 && g_proc.is_valid_address(sub_rtti))
-                        {
-                            uint64 sub_td = g_proc.ru64(sub_rtti + 16);
-                            if (sub_td != 0 && g_proc.is_valid_address(sub_td))
-                            {
-                                string cn = g_proc.rs(sub_td + 16, 128);
-                                if (cn.length() > 0)
-                                    field.set("rtti_name", cn);
-                            }
-                        }
-                    }
-                }
-            }
-            else
-            {
-                float f = g_proc.rf32(addr + off);
-                double d = g_proc.rf64(addr + off);
-                bool likely_float = (f > -1e10 && f < 1e10 && f != 0.0f && (f > 0.001f || f < -0.001f));
-                bool likely_double = (d > -1e15 && d < 1e15 && d != 0.0 && (d > 0.001 || d < -0.001));
-
-                if (likely_float)
-                {
-                    field.set("type", "float_or_int");
-                    field.set("as_float", double(f));
-                }
-                else if (likely_double)
-                {
-                    field.set("type", "double_or_int");
-                    field.set("as_double", d);
-                }
-                else
-                {
-                    field.set("type", "integer");
-                }
-                field.set("as_u32", double(uint(val & 0xFFFFFFFF)));
-                field.set("as_i32", double(int(val & 0xFFFFFFFF)));
-            }
-            fields.insertLast(@field);
-        }
-        res.set("fields", @fields);
-        res.set("field_count", double(fields.length()));
-    }
-}
-
-// ─── Batch Command Handler ──────────────────────────────────────────
-
-void dispatch_command(const string &in cmd, dictionary &in req, dictionary &inout res)
-{
     if      (cmd == "attach")              cmd_attach(req, res);
     else if (cmd == "detach")              cmd_detach(res);
     else if (cmd == "process_info")        cmd_process_info(res);
@@ -2274,51 +1991,8 @@ void dispatch_command(const string &in cmd, dictionary &in req, dictionary &inou
     else if (cmd == "hex_dump")            cmd_hex_dump(req, res);
     else if (cmd == "cs2_get_interface")   cmd_cs2_get_interface(req, res);
     else if (cmd == "cs2_schema_dump")     cmd_cs2_schema_dump(res);
-    else if (cmd == "analyze_object")      cmd_analyze_object(req, res);
     else
         res.set("error", "unknown command: " + cmd);
-}
-
-void cmd_batch(dictionary &in req, dictionary &inout res)
-{
-    array<dictionary@>@ commands;
-    if (!req.get("commands", @commands) || commands is null)
-    {
-        res.set("error", "batch requires 'commands' array");
-        return;
-    }
-
-    array<dictionary@> results;
-    for (uint i = 0; i < commands.length(); i++)
-    {
-        if (commands[i] is null) continue;
-        string sub_cmd = get_dict_string(commands[i], "cmd");
-        dictionary sub_res;
-        dispatch_command(sub_cmd, commands[i], sub_res);
-        results.insertLast(@sub_res);
-    }
-    res.set("results", @results);
-    res.set("count", double(results.length()));
-}
-
-// ─── Request Router ──────────────────────────────────────────────────
-
-void handle_request(dictionary &in req)
-{
-    string cmd;
-    if (!req.get("cmd", cmd)) return;
-
-    string req_id;
-    req.get("_id", req_id);
-
-    dictionary res;
-    if (req_id != "")
-        res.set("_id", req_id);
-
-    if (cmd == "batch")
-        cmd_batch(req, res);
-    else
-        dispatch_command(cmd, req, res);
 
     send_response(res);
 }
@@ -2327,7 +2001,11 @@ void handle_request(dictionary &in req)
 
 // Ticks since last outbound message — used to throttle keepalive pings
 int g_idle_ticks = 0;
-const int KEEPALIVE_INTERVAL = 30; // seconds (callback fires at ~1Hz)
+const int KEEPALIVE_INTERVAL = 30; // seconds (callback fires at 1Hz)
+
+// Backoff counter so we don't hammer ws_connect every tick when no hub exists.
+// Each tick while > 0 simply decrements and skips the connect attempt.
+int g_connect_skip_ticks = 0;
 
 void do_disconnect(const string &in reason)
 {
@@ -2388,12 +2066,28 @@ void ws_pump()
 
 void try_connect()
 {
-    g_ws = ws_connect("ws://127.0.0.1:9001", 2000);
+    // Backoff: after a few fast failures, skip ticks so the callback thread
+    // isn't pinned inside ws_connect() for the full timeout every second.
+    if (g_connect_skip_ticks > 0)
+    {
+        g_connect_skip_ticks--;
+        return;
+    }
+
+    // Short connect timeout (500ms) so a missing hub never blocks the
+    // callback thread for multiple seconds. WinHTTP will still honor it.
+    g_ws = ws_connect("ws://127.0.0.1:9001", 500);
     if (g_ws.is_open())
     {
+        // Announce ourselves immediately. Without this the hub waits 2s on
+        // its identify timeout before setting percClient, during which every
+        // sendCommand fails with "Perception not connected".
+        g_ws.send_text("{\"_perception_hello\":true}");
+
         g_connected = true;
         g_idle_ticks = 0;
         g_retry_count = 0;
+        g_connect_skip_ticks = 0;
         log_console("[RE Server] Connected to MCP server. RE tools available.");
     }
     else
@@ -2404,75 +2098,15 @@ void try_connect()
         // Log every 10 retries to avoid spam (callback fires every ~1s)
         if (g_retry_count == 1 || g_retry_count % 10 == 0)
             log_console("[RE Server] Waiting for MCP server... (attempt " + g_retry_count + ")");
+
+        // After 3 fast failures, back off to roughly 5s between real attempts.
+        if (g_retry_count >= 3)
+            g_connect_skip_ticks = 5;
     }
-}
-
-void check_process_alive()
-{
-    if (!g_attached) return;
-
-    if (!g_proc.alive())
-    {
-        // Process died (crash, exit, etc.) — clean up
-        log_console("[RE Server] Process died (PID " + g_last_pid + ") — auto-detached.");
-        g_proc.deref();
-        g_proc = proc_t();
-        g_attached = false;
-        g_snapshots.deleteAll();
-        g_reattach_cooldown = 5; // wait 5s before trying to reattach
-
-        // Notify MCP side if connected
-        if (g_connected && g_ws.is_open())
-        {
-            string notify = "{\"_event\":\"process_died\",\"pid\":" + g_last_pid + ",\"name\":\"" + mcp_json_escape(g_last_proc_name) + "\"}";
-            g_ws.send_text(notify);
-        }
-        return;
-    }
-}
-
-void try_reattach()
-{
-    // Only reattach if we have a name to reattach to and aren't already attached
-    if (g_attached || g_last_proc_name == "") return;
-
-    if (g_reattach_cooldown > 0) { g_reattach_cooldown--; return; }
-
-    // Try to find the process again
-    proc_t p = ref_process(g_last_proc_name);
-    if (p.alive())
-    {
-        // Don't reattach to the same dying PID
-        if (p.pid() != g_last_pid || g_last_pid == 0)
-        {
-            g_proc = p;
-            g_attached = true;
-            g_last_pid = g_proc.pid();
-            log_console("[RE Server] Auto-reattached to " + g_last_proc_name + " (PID " + g_last_pid + ")");
-
-            if (g_connected && g_ws.is_open())
-            {
-                string notify = "{\"_event\":\"process_reattached\",\"pid\":" + g_last_pid + ",\"name\":\"" + mcp_json_escape(g_last_proc_name) + "\",\"base\":\"" + to_hex(g_proc.base_address()) + "\"}";
-                g_ws.send_text(notify);
-            }
-            return;
-        }
-        p.deref();
-    }
-
-    // Process not found yet, try again in 3 seconds
-    g_reattach_cooldown = 3;
 }
 
 void ws_callback(int, int)
 {
-    // Check if attached process is still alive (auto-detach on crash)
-    check_process_alive();
-
-    // Try to reattach if process died and we have a name
-    if (!g_attached && g_last_proc_name != "")
-        try_reattach();
-
     if (g_connected)
         ws_pump();
     else
@@ -2486,7 +2120,11 @@ int main()
     log_console("[RE Server] Starting Perception RE server (background mode)...");
     log_console("[RE Server] Will keep looking for MCP at ws://127.0.0.1:9001");
 
-    g_callback_id = register_callback(ws_callback, 1, 0);
+    // register_callback interval is in MILLISECONDS, not seconds. 1000 = 1Hz.
+    // Previously this was `1`, which fired the callback every 1ms (1000Hz) and
+    // caused the callback thread to block on ws_connect() nonstop, deadlocking
+    // script shutdown/reload while WinHTTP was mid-connect.
+    g_callback_id = register_callback(ws_callback, 1000, 0);
     if (g_callback_id == 0)
     {
         log_error("[RE Server] Failed to register callback");
