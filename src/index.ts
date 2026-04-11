@@ -105,6 +105,18 @@ function attachHubHandlers(wss: WebSocketServer) {
         }
 
         if (clientType === "perception") {
+          // Process lifecycle events from AngelScript auto-reattach
+          if (msg._event) {
+            console.error(`[perception-mcp] Event: ${msg._event} — ${msg.detail || ""}`);
+            // Broadcast to all relay clients so they know too
+            for (const [, rws] of relayClients) {
+              if (rws.readyState === WebSocket.OPEN) {
+                rws.send(JSON.stringify(msg));
+              }
+            }
+            return;
+          }
+
           // Response from Perception — route to correct requester
           const id: string = msg._id;
           if (!id) return; // hub pings and keepalives arrive here — silently ignored

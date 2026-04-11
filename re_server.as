@@ -13,6 +13,13 @@ int    g_retry_count = 0;
 // Memory snapshots for diff
 dictionary g_snapshots;
 
+// Auto-reattach state
+string g_last_process_name = "";
+uint   g_last_process_pid  = 0;
+bool   g_waiting_reattach  = false;
+int    g_reattach_ticks    = 0;       // cooldown between reattach attempts
+const int REATTACH_INTERVAL = 3;      // seconds between reattach polls
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 const string HEX_CHARS = "0123456789abcdef";
@@ -281,10 +288,21 @@ void cmd_attach(dictionary &in req, dictionary &inout res)
     }
 
     g_attached = true;
+    g_waiting_reattach = false;
+    g_reattach_ticks = 0;
+
+    // Remember for auto-reattach
+    if (name != "")
+        g_last_process_name = name;
+    else
+        g_last_process_name = "";
+    g_last_process_pid = g_proc.pid();
+
     res.set("result", "attached");
     res.set("pid", double(g_proc.pid()));
     res.set("base", to_hex(g_proc.base_address()));
     res.set("peb", to_hex(g_proc.peb()));
+    log_console("[RE Server] Attached to process (PID " + g_last_process_pid + ")");
 }
 
 void cmd_detach(dictionary &inout res)
@@ -293,7 +311,11 @@ void cmd_detach(dictionary &inout res)
         g_proc.deref();
     g_proc = proc_t();
     g_attached = false;
+    g_waiting_reattach = false;
+    g_last_process_name = "";
+    g_last_process_pid = 0;
     res.set("result", "detached");
+    log_console("[RE Server] Detached (auto-reattach disabled)");
 }
 
 void cmd_process_info(dictionary &inout res)
@@ -2105,10 +2127,62 @@ void try_connect()
     }
 }
 
+// ─── Process Lifecycle (auto-detach / reattach) ─────────────────────
+
+void send_event(const string &in event, const string &in detail)
+{
+    if (!g_connected || !g_ws.is_open()) return;
+    g_ws.send_text("{\"_event\":\"" + event + "\",\"detail\":\"" + detail + "\"}");
+}
+
+void check_process_lifecycle()
+{
+    // Case 1: We think we're attached but the process died
+    if (g_attached && !g_proc.alive())
+    {
+        log_console("[RE Server] Process died (PID " + g_last_process_pid + ") — auto-detaching");
+        g_proc.deref();
+        g_proc = proc_t();
+        g_attached = false;
+
+        // If we know the process name, start polling for reattach
+        if (g_last_process_name != "")
+        {
+            g_waiting_reattach = true;
+            g_reattach_ticks = REATTACH_INTERVAL; // small delay before first attempt
+            log_console("[RE Server] Will auto-reattach to \"" + g_last_process_name + "\" when it restarts");
+        }
+
+        send_event("process_died", "PID " + g_last_process_pid);
+        return;
+    }
+
+    // Case 2: Waiting for process to come back
+    if (g_waiting_reattach)
+    {
+        g_reattach_ticks--;
+        if (g_reattach_ticks > 0) return;
+        g_reattach_ticks = REATTACH_INTERVAL;
+
+        g_proc = ref_process(g_last_process_name);
+        if (g_proc.alive())
+        {
+            g_attached = true;
+            g_waiting_reattach = false;
+            g_last_process_pid = g_proc.pid();
+            log_console("[RE Server] Auto-reattached to \"" + g_last_process_name + "\" (PID " + g_last_process_pid + ")");
+            send_event("process_reattached", "PID " + g_last_process_pid);
+        }
+    }
+}
+
 void ws_callback(int, int)
 {
     if (g_connected)
+    {
+        check_process_lifecycle();
         ws_pump();
+    }
     else
         try_connect();
 }
@@ -2151,5 +2225,8 @@ void on_unload()
     g_proc = proc_t();
 
     g_attached = false;
+    g_waiting_reattach = false;
+    g_last_process_name = "";
+    g_last_process_pid = 0;
     log_console("[RE Server] Unloaded");
 }
