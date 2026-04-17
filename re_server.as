@@ -98,6 +98,15 @@ string mcp_json_escape(const string &in s)
         else if (c == 10) r += "\\n";    // newline
         else if (c == 13) r += "\\r";    // carriage return
         else if (c == 9) r += "\\t";     // tab
+        else if (c < 0x20 || c >= 0x7F)
+        {
+            // Escape control bytes AND all non-ASCII as \uXXXX. Raw high-bit
+            // bytes produce invalid UTF-8 text frames, which crash the WS
+            // receiver (code 1007) and kill the hub process.
+            r += "\\u00";
+            r += HEX_CHARS.substr((c >> 4) & 0xF, 1);
+            r += HEX_CHARS.substr(c & 0xF, 1);
+        }
         else
         {
             string ch;
@@ -962,32 +971,42 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
     else if (type == "u64")
     {
         string v = get_dict_string(req, "value");
+        if (v.length() == 0) { res.set("error", "value is required for u64 scan"); return; }
         @results = g_proc.scan_u64(parse_hex(v), heap_only);
     }
     else if (type == "float")
     {
         double v; req.get("value", v);
-        @results = g_proc.scan_float(float(v), heap_only);
+        float fv = float(v);
+        // Reject NaN / Inf — scan_float throws on them
+        if (fv != fv || v != v) { res.set("error", "value is NaN"); return; }
+        @results = g_proc.scan_float(fv, heap_only);
     }
     else if (type == "double")
     {
         double v; req.get("value", v);
+        if (v != v) { res.set("error", "value is NaN"); return; }
         @results = g_proc.scan_double(v, heap_only);
     }
     else if (type == "string")
     {
         string v = get_dict_string(req, "value");
+        if (v.length() == 0) { res.set("error", "value (search string) is empty"); return; }
         @results = g_proc.scan_string(v, heap_only);
     }
     else if (type == "wstring")
     {
         string v = get_dict_string(req, "value");
+        if (v.length() == 0) { res.set("error", "value (search string) is empty"); return; }
         @results = g_proc.scan_wstring(v, heap_only);
     }
     else if (type == "pointer")
     {
         string v = get_dict_string(req, "value");
-        @results = g_proc.scan_pointer(parse_hex(v), heap_only);
+        if (v.length() == 0) { res.set("error", "value is required for pointer scan"); return; }
+        uint64 ptr = parse_hex(v);
+        if (ptr == 0) { res.set("error", "pointer target is 0"); return; }
+        @results = g_proc.scan_pointer(ptr, heap_only);
     }
     else
     {
@@ -1516,6 +1535,7 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
     uint   page_offset = uint(get_dict_double(req, "page_offset", 0));
     uint   page_limit  = uint(get_dict_double(req, "page_limit",  1000));
     if (page_limit == 0 || page_limit > 5000) page_limit = 1000;
+    if (target == 0) { res.set("error", "invalid target address (got 0)"); return; }
 
     array<uint64>@ results = g_proc.scan_pointer(target, heap_only);
     if (results is null) { res.set("error", "scan failed"); return; }
@@ -1541,6 +1561,7 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     string search = get_dict_string(req, "search_text");
+    if (search.length() == 0) { res.set("error", "search_text is empty"); return; }
 
     // First find the strings in memory
     array<uint64>@ string_addrs = g_proc.scan_string(search, false);

@@ -57,9 +57,21 @@ function tryStartHub(): Promise<boolean> {
 }
 
 function attachHubHandlers(wss: WebSocketServer) {
+  // Server-level error (bind races, unhandled internals). Log; do not crash.
+  wss.on("error", (err) => {
+    console.error("[perception-mcp] WebSocketServer error:", err);
+  });
+
   wss.on("connection", (ws) => {
     let clientType: "unknown" | "perception" | "relay" = "unknown";
     let relayId = "";
+
+    // Per-socket error handler — without this, invalid frames (bad UTF-8,
+    // protocol errors) throw an unhandled 'error' event and crash the whole
+    // MCP process. We absorb the error; the 'close' event will clean up.
+    ws.on("error", (err) => {
+      console.error(`[perception-mcp] WS error (${clientType}):`, err.message || err);
+    });
 
     // First message determines client type
     const identifyTimeout = setTimeout(() => {
