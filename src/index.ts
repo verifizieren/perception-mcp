@@ -16,7 +16,7 @@ import { WebSocketServer, WebSocket } from "ws";
 // Hub routes responses back to the correct relay client using _id prefix.
 
 const WS_PORT = 9001;
-let pendingRequests = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+let pendingRequests = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> | undefined }>();
 let requestId = 0;
 let instanceId = `mcp_${process.pid}_${Date.now()}`;
 let isHub = false;
@@ -265,10 +265,10 @@ function sendCommand(cmd: string, params: Record<string, any> = {}, timeoutMs = 
         return reject(new Error("Perception AngelScript not connected. Load re_server.as in Perception first."));
       }
       const id = `${instanceId}_req_${++requestId}`;
-      const timer = setTimeout(() => {
+      const timer = timeoutMs > 0 ? setTimeout(() => {
         pendingRequests.delete(id);
         reject(new Error(`Request timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+      }, timeoutMs) : undefined;
 
       pendingRequests.set(id, { resolve, reject, timer });
       percClient.send(JSON.stringify({ _id: id, cmd, ...params }));
@@ -279,10 +279,10 @@ function sendCommand(cmd: string, params: Record<string, any> = {}, timeoutMs = 
         return reject(new Error("Not connected to hub. Is the first Claude Code instance still running?"));
       }
       const id = `${instanceId}_req_${++requestId}`;
-      const timer = setTimeout(() => {
+      const timer = timeoutMs > 0 ? setTimeout(() => {
         pendingRequests.delete(id);
         reject(new Error(`Request timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+      }, timeoutMs) : undefined;
 
       pendingRequests.set(id, { resolve, reject, timer });
       hubConnection.send(JSON.stringify({ _id: id, cmd, ...params }));
@@ -503,7 +503,7 @@ server.tool(
     module_name: z.string().optional().describe("Module to scan"),
     max_results: z.number().optional().describe("Cap on matches returned (default 500, max 5000). count field always reflects the true total.") },
   async (params) => {
-    const res = await callTool("pattern_scan_all", params, 60000);
+    const res = await callTool("pattern_scan_all", params, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -631,7 +631,7 @@ server.tool(
     page_offset: z.number().optional().describe("Skip this many results before returning (default 0)"),
     page_limit:  z.number().optional().describe("Max addresses to return (default 1000, max 5000)") },
   async (params) => {
-    const res = await callTool("scan_value", params, 120000);
+    const res = await callTool("scan_value", params, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -646,7 +646,7 @@ server.tool(
     size: z.string().optional().describe("Search region size in hex"),
     module_name: z.string().optional().describe("Module to search in") },
   async (params) => {
-    const res = await callTool("find_xrefs", params, 60000);
+    const res = await callTool("find_xrefs", params, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -660,7 +660,7 @@ server.tool(
     max_entries: z.number().optional().describe("Max entries to read (default 50)"),
     disasm_preview: z.boolean().optional().describe("Disassemble first few instructions of each entry (default false)") },
   async (params) => {
-    const res = await callTool("analyze_vtable", { address: params.address, max_entries: params.max_entries ?? 50, disasm_preview: params.disasm_preview ?? false }, 60000);
+    const res = await callTool("analyze_vtable", { address: params.address, max_entries: params.max_entries ?? 50, disasm_preview: params.disasm_preview ?? false }, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -708,7 +708,7 @@ server.tool(
   { address: z.string().describe("Function start address"),
     max_size: z.number().optional().describe("Max bytes to analyze (default 4096)") },
   async (params) => {
-    const res = await callTool("analyze_function", { address: params.address, max_size: params.max_size ?? 4096 }, 60000);
+    const res = await callTool("analyze_function", { address: params.address, max_size: params.max_size ?? 4096 }, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -748,7 +748,7 @@ server.tool(
     page_offset: z.number().optional().describe("Skip this many results before returning (default 0)"),
     page_limit:  z.number().optional().describe("Max addresses to return (default 1000, max 5000)") },
   async (params) => {
-    const res = await callTool("scan_pointer_to", params, 120000);
+    const res = await callTool("scan_pointer_to", params, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -761,7 +761,7 @@ server.tool(
   { search_text: z.string().describe("Text to search for in strings"),
     module_name: z.string().optional().describe("Module to search (default: main)") },
   async (params) => {
-    const res = await callTool("find_string_refs", params, 60000);
+    const res = await callTool("find_string_refs", params, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
@@ -883,7 +883,7 @@ server.tool(
   "Dump CS2 schema system (all classes and field offsets)",
   {},
   async () => {
-    const res = await callTool("cs2_schema_dump", {}, 60000);
+    const res = await callTool("cs2_schema_dump", {}, 0);
     return { content: [{ type: "text", text: res }] };
   }
 );
