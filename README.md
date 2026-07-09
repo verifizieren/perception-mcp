@@ -19,7 +19,7 @@ Multiple Claude Code instances can share the same Perception connection simultan
 ## Installation
 
 ```bash
-git clone https://github.com/<your-user>/perception-mcp.git
+git clone https://github.com/verifizieren/perception-mcp.git
 cd perception-mcp
 npm install
 npm run build
