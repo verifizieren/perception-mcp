@@ -43,6 +43,63 @@ uint64 parse_hex(const string &in s)
     return result;
 }
 
+// Parse numeric string as u64 without float precision loss.
+// hex if 0x-prefixed, otherwise decimal.
+uint64 parse_u64_str(const string &in s)
+{
+    string t = s;
+    while (t.length() > 0 && t[0] == 32) t = t.substr(1);
+    if (t.length() > 2 && (t.substr(0, 2) == "0x" || t.substr(0, 2) == "0X"))
+        return parse_hex(t);
+    uint64 r = 0;
+    for (uint i = 0; i < t.length(); i++)
+    {
+        uint8 c = t[i];
+        if (c < 48 || c > 57) break;
+        r = r * 10 + uint64(c - 48);
+    }
+    return r;
+}
+
+// Parse numeric string as i64: optional leading '-', hex (0x) or decimal.
+int64 parse_i64_str(const string &in s)
+{
+    string t = s;
+    while (t.length() > 0 && t[0] == 32) t = t.substr(1);
+    bool neg = false;
+    if (t.length() > 0 && t[0] == 45) { neg = true; t = t.substr(1); }
+    int64 v = int64(parse_u64_str(t));
+    return neg ? -v : v;
+}
+
+// x86-64 GP register name -> Unicorn reg id, -1 if unknown.
+int reg_name_to_id(const string &in name)
+{
+    string r = name;
+    for (uint i = 0; i < r.length(); i++)
+    {
+        uint8 c = r[i];
+        if (c >= 65 && c <= 90) r[i] = uint8(c + 32); // lowercase
+    }
+    if      (r == "rax") return UC_X86_REG_RAX;
+    else if (r == "rbx") return UC_X86_REG_RBX;
+    else if (r == "rcx") return UC_X86_REG_RCX;
+    else if (r == "rdx") return UC_X86_REG_RDX;
+    else if (r == "rsi") return UC_X86_REG_RSI;
+    else if (r == "rdi") return UC_X86_REG_RDI;
+    else if (r == "rbp") return UC_X86_REG_RBP;
+    else if (r == "r8")  return UC_X86_REG_R8;
+    else if (r == "r9")  return UC_X86_REG_R9;
+    else if (r == "r10") return UC_X86_REG_R10;
+    else if (r == "r11") return UC_X86_REG_R11;
+    else if (r == "r12") return UC_X86_REG_R12;
+    else if (r == "r13") return UC_X86_REG_R13;
+    else if (r == "r14") return UC_X86_REG_R14;
+    else if (r == "r15") return UC_X86_REG_R15;
+    else if (r == "rip") return UC_X86_REG_RIP;
+    return -1;
+}
+
 string to_hex(uint64 v)
 {
     if (v == 0) return "0x0";
@@ -129,14 +186,17 @@ string mcp_serialize_str_arr(array<string> &in arr)
     return r + "]";
 }
 
-string array_mcp_serialize_dict(array<dictionary@> &in arr)
+string mcp_serialize_num_arr(array<double> &in arr)
 {
     string r = "[";
     for (uint i = 0; i < arr.length(); i++)
     {
         if (i > 0) r += ",";
-        if (arr[i] is null) r += "null";
-        else r += mcp_serialize_dict(arr[i]);
+        double dv = arr[i];
+        if (dv == double(int64(dv)) && dv < 1e15 && dv > -1e15)
+            r += formatInt(int64(dv));
+        else
+            r += formatFloat(dv, '', 0, 17);
     }
     return r + "]";
 }
@@ -203,7 +263,7 @@ string mcp_serialize_dict(dictionary &in d)
                 if (dv == double(int64(dv)) && dv < 1e15 && dv > -1e15)
                     val_str = formatInt(int64(dv));
                 else
-                    val_str = formatFloat(dv, '', 0, 6);
+                    val_str = formatFloat(dv, '', 0, 17);
                 found = true;
             }
         }
@@ -216,6 +276,17 @@ string mcp_serialize_dict(dictionary &in d)
             if (d.get(k, sa))
             {
                 val_str = mcp_serialize_str_arr(sa);
+                found = true;
+            }
+        }
+
+        // 4b. array<double> — numeric value arrays (read_values non-64-bit types).
+        if (!found)
+        {
+            array<double> na;
+            if (d.get(k, na))
+            {
+                val_str = mcp_serialize_num_arr(na);
                 found = true;
             }
         }
@@ -353,7 +424,9 @@ void cmd_read_memory(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint size = uint(get_dict_double(req, "size"));
+    bool raw = get_dict_bool(req, "raw");
     if (size == 0 || size > 1048576) { res.set("error", "invalid size (max 1MB)"); return; }
+    if (size > 65536 && !raw) { res.set("error", "size > 64KB requires raw:true (hex payload gets huge)"); return; }
 
     array<uint8> data;
     g_proc.rvm(addr, size, data);
@@ -369,38 +442,45 @@ void cmd_read_values(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     string type = get_dict_string(req, "type");
-    uint count = uint(get_dict_double(req, "count", 1));
+    double count_d = get_dict_double(req, "count", 1);
+    if (count_d < 0 || count_d > 4294967295.0) { res.set("error", "count out of range"); return; }
+    uint count = uint(count_d);
     if (count == 0) count = 1;
-    if (count > 1024) count = 1024;
+    if (count > 1024) { res.set("error", "count > 1024 (max 1024)"); return; }
 
-    array<dictionary@> values;
+    // 64-bit ints returned as hex strings (JSON number precision unsafe); others as numbers.
+    bool as_hex = (type == "u64" || type == "i64");
+    array<string> svals;
+    array<double> dvals;
     for (uint i = 0; i < count; i++)
     {
-        dictionary v;
         uint64 a = addr;
-        if (type == "u8")       { a += i;     v.set("value", double(g_proc.ru8(a))); v.set("hex", to_hex(g_proc.ru8(a))); }
-        else if (type == "u16") { a += i * 2; v.set("value", double(g_proc.ru16(a))); v.set("hex", to_hex(g_proc.ru16(a))); }
-        else if (type == "u32") { a += i * 4; v.set("value", double(g_proc.ru32(a))); v.set("hex", to_hex(g_proc.ru32(a))); }
-        else if (type == "u64") { a += i * 8; v.set("value", to_hex(g_proc.ru64(a))); }
-        else if (type == "i8")  { a += i;     v.set("value", double(g_proc.r8(a))); }
-        else if (type == "i16") { a += i * 2; v.set("value", double(g_proc.r16(a))); }
-        else if (type == "i32") { a += i * 4; v.set("value", double(g_proc.r32(a))); }
-        else if (type == "i64") { a += i * 8; v.set("value", double(g_proc.r64(a))); }
-        else if (type == "f32") { a += i * 4; v.set("value", double(g_proc.rf32(a))); }
-        else if (type == "f64") { a += i * 8; v.set("value", g_proc.rf64(a)); }
+        if      (type == "u8")  { a += i;     dvals.insertLast(double(g_proc.ru8(a))); }
+        else if (type == "u16") { a += i * 2; dvals.insertLast(double(g_proc.ru16(a))); }
+        else if (type == "u32") { a += i * 4; dvals.insertLast(double(g_proc.ru32(a))); }
+        else if (type == "u64") { a += i * 8; svals.insertLast(to_hex(g_proc.ru64(a))); }
+        else if (type == "i8")  { a += i;     dvals.insertLast(double(g_proc.r8(a))); }
+        else if (type == "i16") { a += i * 2; dvals.insertLast(double(g_proc.r16(a))); }
+        else if (type == "i32") { a += i * 4; dvals.insertLast(double(g_proc.r32(a))); }
+        else if (type == "i64") { a += i * 8; svals.insertLast(to_hex(uint64(g_proc.r64(a)))); }
+        else if (type == "f32") { a += i * 4; dvals.insertLast(double(g_proc.rf32(a))); }
+        else if (type == "f64") { a += i * 8; dvals.insertLast(g_proc.rf64(a)); }
         else { res.set("error", "unknown type: " + type); return; }
-
-        v.set("address", to_hex(a));
-        values.insertLast(@v);
     }
-    res.set("values", @values);
+    res.set("base", to_hex(addr));
+    res.set("type", type);
+    if (as_hex) res.set("values", svals);
+    else        res.set("values", dvals);
 }
 
 void cmd_read_string(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
-    int max_len = int(get_dict_double(req, "max_length", 256));
+    double ml_d = get_dict_double(req, "max_length", 256);
+    if (ml_d < 0 || ml_d > 65536) { res.set("error", "max_length out of range (0..65536)"); return; }
+    int max_len = int(ml_d);
+    if (max_len == 0) max_len = 256;
     res.set("value", g_proc.rs(addr, max_len));
     res.set("address", to_hex(addr));
 }
@@ -409,7 +489,10 @@ void cmd_read_wstring(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
-    int max_len = int(get_dict_double(req, "max_length", 256));
+    double mlw_d = get_dict_double(req, "max_length", 256);
+    if (mlw_d < 0 || mlw_d > 65536) { res.set("error", "max_length out of range (0..65536)"); return; }
+    int max_len = int(mlw_d);
+    if (max_len == 0) max_len = 256;
     res.set("value", g_proc.rws(addr, max_len));
     res.set("address", to_hex(addr));
 }
@@ -419,102 +502,46 @@ void cmd_read_pointer_chain(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "base"));
     string final_type = get_dict_string(req, "final_type", "ptr");
+    bool verbose = get_dict_bool(req, "verbose");
+    string offsets_csv = get_dict_string(req, "offsets_csv", "");
 
-    array<string> offsets_arr;
-    array<dictionary@>@ offsets_raw;
-    // offsets come as array of strings
-    if (!req.get("offsets", @offsets_raw))
-    {
-        res.set("error", "missing offsets array");
-        return;
-    }
+    if (addr == 0)          { res.set("error", "missing/invalid base"); return; }
+    if (offsets_csv == "")  { res.set("error", "missing offsets_csv"); return; }
 
+    array<string> parts = str_split(offsets_csv, ",");
     array<dictionary@> chain_steps;
 
-    // Follow the pointer chain
-    for (uint i = 0; i < offsets_raw.length(); i++)
+    for (uint i = 0; i < parts.length(); i++)
     {
-        // Each element is a string in the array
-        string off_str;
-        // The MCP sends offsets as array of strings, but JSON arrays become array<dictionary@>
-        // Try to extract string value
-        // Actually in Perception JSON, arrays of strings come as... let's handle both
-        uint64 prev_addr = addr;
-        string offset_hex;
+        uint64 offset = parse_hex(parts[i]);
+        uint64 ptr = g_proc.ru64(addr);
+        if (ptr == 0) { res.set("error", "null pointer at step " + i + " addr=" + to_hex(addr)); return; }
 
-        // Read offset from the dictionary (JSON array element)
-        if (offsets_raw[i] !is null)
+        if (verbose)
         {
-            // Try to get as string directly - won't work for plain string arrays
-            // In Perception JSON, string arrays might be different
-        }
-
-        // Fallback: parse from request directly
-        // The offsets are sent as an array of strings in JSON
-        // Let's try a different approach - get the offsets as a single comma-separated string
-    }
-
-    // Alternative: use offsets_csv field
-    string offsets_csv = get_dict_string(req, "offsets_csv", "");
-    array<string> off_parts;
-
-    // Parse the offsets - they should be available somehow
-    // Let's use the raw array approach
-    if (offsets_csv == "" && offsets_raw !is null)
-    {
-        // Read pointer through each offset
-        for (uint i = 0; i < offsets_raw.length(); i++)
-        {
-            string os;
-            if (offsets_raw[i] !is null && offsets_raw[i].get("value", os))
-            {
-                uint64 offset = parse_hex(os);
-                uint64 ptr = g_proc.ru64(addr);
-                if (ptr == 0) { res.set("error", "null pointer at step " + i + " addr=" + to_hex(addr)); return; }
-
-                dictionary step;
-                step.set("step", double(i));
-                step.set("read_from", to_hex(addr));
-                step.set("pointer_value", to_hex(ptr));
-                step.set("offset", to_hex(offset));
-                addr = ptr + offset;
-                step.set("result", to_hex(addr));
-                chain_steps.insertLast(@step);
-            }
-        }
-    }
-
-    // Actually, let me just handle offsets as a comma-separated string sent from MCP
-    // The MCP side will convert the array to CSV
-    if (offsets_csv != "")
-    {
-        array<string> parts = str_split(offsets_csv, ",");
-        for (uint i = 0; i < parts.length(); i++)
-        {
-            uint64 offset = parse_hex(parts[i]);
-            uint64 ptr = g_proc.ru64(addr);
-            if (ptr == 0) { res.set("error", "null pointer at step " + i + " addr=" + to_hex(addr)); return; }
-
             dictionary step;
             step.set("step", double(i));
             step.set("read_from", to_hex(addr));
             step.set("pointer_value", to_hex(ptr));
             step.set("offset", to_hex(offset));
-            addr = ptr + offset;
-            step.set("result", to_hex(addr));
+            step.set("result", to_hex(ptr + offset));
             chain_steps.insertLast(@step);
         }
+        addr = ptr + offset;
     }
 
-    res.set("chain", @chain_steps);
+    if (verbose) res.set("chain", @chain_steps);
     res.set("final_address", to_hex(addr));
 
-    // Read final value
-    if (final_type == "u8")       res.set("final_value", double(g_proc.ru8(addr)));
+    // Read final value. 64-bit ints returned as hex strings (JSON number precision unsafe).
+    if      (final_type == "u8")  res.set("final_value", double(g_proc.ru8(addr)));
     else if (final_type == "u16") res.set("final_value", double(g_proc.ru16(addr)));
     else if (final_type == "u32") res.set("final_value", double(g_proc.ru32(addr)));
     else if (final_type == "u64") res.set("final_value", to_hex(g_proc.ru64(addr)));
+    else if (final_type == "i8")  res.set("final_value", double(g_proc.r8(addr)));
+    else if (final_type == "i16") res.set("final_value", double(g_proc.r16(addr)));
     else if (final_type == "i32") res.set("final_value", double(g_proc.r32(addr)));
+    else if (final_type == "i64") res.set("final_value", to_hex(uint64(g_proc.r64(addr))));
     else if (final_type == "f32") res.set("final_value", double(g_proc.rf32(addr)));
     else if (final_type == "f64") res.set("final_value", g_proc.rf64(addr));
     else /* ptr */                res.set("final_value", to_hex(g_proc.ru64(addr)));
@@ -563,7 +590,6 @@ void cmd_read_struct(dictionary &in req, dictionary &inout res)
         dictionary f;
         f.set("name", name);
         f.set("offset", to_hex(offset));
-        f.set("address", to_hex(addr));
 
         if (type == "u8")        f.set("value", double(g_proc.ru8(addr)));
         else if (type == "u16")  f.set("value", double(g_proc.ru16(addr)));
@@ -572,7 +598,7 @@ void cmd_read_struct(dictionary &in req, dictionary &inout res)
         else if (type == "i8")   f.set("value", double(g_proc.r8(addr)));
         else if (type == "i16")  f.set("value", double(g_proc.r16(addr)));
         else if (type == "i32")  f.set("value", double(g_proc.r32(addr)));
-        else if (type == "i64")  f.set("value", double(g_proc.r64(addr)));
+        else if (type == "i64")  f.set("value", to_hex(uint64(g_proc.r64(addr))));
         else if (type == "f32")  f.set("value", double(g_proc.rf32(addr)));
         else if (type == "f64")  f.set("value", g_proc.rf64(addr));
         else if (type == "string")  f.set("value", g_proc.rs(addr, max_chars));
@@ -582,6 +608,7 @@ void cmd_read_struct(dictionary &in req, dictionary &inout res)
 
         result.insertLast(@f);
     }
+    res.set("base", to_hex(base_addr));
     res.set("fields", @result);
 }
 
@@ -591,6 +618,7 @@ void cmd_read_pointer_array(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint count = uint(get_dict_double(req, "count"));
     int delta = int(get_dict_double(req, "offset_delta"));
+    if (count == 0 || count > 4096) { res.set("error", "invalid count (1..4096)"); return; }
 
     array<uint64>@ ptrs = g_proc.read_pointer_array(addr, count, delta);
     if (ptrs is null) { res.set("error", "read_pointer_array failed"); return; }
@@ -609,6 +637,8 @@ void cmd_write_memory(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     string hex = get_dict_string(req, "data");
+    if (hex.length() == 0) { res.set("error", "data is empty"); return; }
+    if (hex.length() > 2097152) { res.set("error", "hex payload too large (max 2MB = 1MB bytes)"); return; }
 
     string raw, err;
     if (!util_hex_decode(hex, raw, err)) { res.set("error", "invalid hex: " + err); return; }
@@ -633,22 +663,25 @@ void cmd_write_values(dictionary &in req, dictionary &inout res)
     if (values_csv == "") { res.set("error", "missing values_csv"); return; }
 
     array<string> parts = str_split(values_csv, ",");
+    if (parts.length() > 1024) { res.set("error", "too many values (max 1024)"); return; }
     uint written = 0;
     for (uint i = 0; i < parts.length(); i++)
     {
-        double v = parseFloat(parts[i]);
+        string tok = parts[i];
         bool ok = false;
         uint64 a = addr;
-        if (type == "u8")       { a += i;     ok = g_proc.wu8(a, uint8(v)); }
-        else if (type == "u16") { a += i * 2; ok = g_proc.wu16(a, uint16(v)); }
-        else if (type == "u32") { a += i * 4; ok = g_proc.wu32(a, uint32(v)); }
-        else if (type == "u64") { a += i * 8; ok = g_proc.wu64(a, uint64(v)); }
-        else if (type == "i8")  { a += i;     ok = g_proc.w8(a, int8(v)); }
-        else if (type == "i16") { a += i * 2; ok = g_proc.w16(a, int16(v)); }
-        else if (type == "i32") { a += i * 4; ok = g_proc.w32(a, int32(v)); }
-        else if (type == "i64") { a += i * 8; ok = g_proc.w64(a, int64(v)); }
-        else if (type == "f32") { a += i * 4; ok = g_proc.wf32(a, float(v)); }
-        else if (type == "f64") { a += i * 8; ok = g_proc.wf64(a, v); }
+        // Integers parsed from string (hex or decimal) — no float precision loss on 64-bit.
+        if (type == "u8")       { a += i;     ok = g_proc.wu8(a, uint8(parse_u64_str(tok))); }
+        else if (type == "u16") { a += i * 2; ok = g_proc.wu16(a, uint16(parse_u64_str(tok))); }
+        else if (type == "u32") { a += i * 4; ok = g_proc.wu32(a, uint32(parse_u64_str(tok))); }
+        else if (type == "u64") { a += i * 8; ok = g_proc.wu64(a, parse_u64_str(tok)); }
+        else if (type == "i8")  { a += i;     ok = g_proc.w8(a, int8(parse_i64_str(tok))); }
+        else if (type == "i16") { a += i * 2; ok = g_proc.w16(a, int16(parse_i64_str(tok))); }
+        else if (type == "i32") { a += i * 4; ok = g_proc.w32(a, int32(parse_i64_str(tok))); }
+        else if (type == "i64") { a += i * 8; ok = g_proc.w64(a, parse_i64_str(tok)); }
+        else if (type == "f32") { a += i * 4; ok = g_proc.wf32(a, float(parseFloat(tok))); }
+        else if (type == "f64") { a += i * 8; ok = g_proc.wf64(a, parseFloat(tok)); }
+        else { res.set("error", "unknown type: " + type); return; }
         if (ok) written++;
     }
     res.set("result", "wrote " + written + " values");
@@ -746,7 +779,8 @@ void cmd_pattern_scan_all(dictionary &in req, dictionary &inout res)
     if (size == 0) { res.set("error", "could not determine scan region"); return; }
 
     uint max_results = uint(get_dict_double(req, "max_results", 500));
-    if (max_results == 0 || max_results > 5000) max_results = 500;
+    if (max_results == 0) max_results = 500;
+    if (max_results > 5000) max_results = 5000;
 
     array<uint64> results;
     g_proc.find_all_code_patterns(start, size, sig, results);
@@ -811,7 +845,8 @@ void cmd_disassemble(dictionary &in req, dictionary &inout res)
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint count = uint(get_dict_double(req, "count", 10));
     uint size = uint(get_dict_double(req, "size", 256));
-    if (size > 4096) size = 4096;
+    if (size > 4096) { res.set("error", "size > 4096 (max 4096)"); return; }
+    bool want_bytes = get_dict_bool(req, "bytes", false);
 
     array<uint8> code;
     g_proc.rvm(addr, size, code);
@@ -827,24 +862,24 @@ void cmd_disassemble(dictionary &in req, dictionary &inout res)
         if (insts[i] is null) continue;
         dictionary inst;
         int64 runtime_addr;
-        string mnemonic, text;
+        string text;
         int64 length;
         insts[i].get("runtime_address", runtime_addr);
-        insts[i].get("mnemonic", mnemonic);
         insts[i].get("text", text);
         insts[i].get("length", length);
 
         inst.set("address", to_hex(uint64(runtime_addr)));
-        inst.set("mnemonic", mnemonic);
         inst.set("text", text);
         inst.set("size", double(length));
 
-        // Get bytes for this instruction
-        uint64 offset = uint64(runtime_addr) - addr;
-        array<uint8> inst_bytes;
-        for (uint b = 0; b < uint(length) && (offset + b) < code.length(); b++)
-            inst_bytes.insertLast(code[offset + b]);
-        inst.set("bytes", bytes_to_hex(inst_bytes));
+        if (want_bytes)
+        {
+            uint64 offset = uint64(runtime_addr) - addr;
+            array<uint8> inst_bytes;
+            for (uint b = 0; b < uint(length) && (offset + b) < code.length(); b++)
+                inst_bytes.insertLast(code[offset + b]);
+            inst.set("bytes", bytes_to_hex(inst_bytes));
+        }
 
         output.insertLast(@inst);
     }
@@ -887,7 +922,13 @@ void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
     array<dictionary@>@ vads = g_proc.get_vad_snapshot(heap_only);
     if (vads is null) { res.set("error", "VAD snapshot failed"); return; }
 
+    // Pagination: cap output to `limit` (default 500, max 5000) starting from `page_offset`.
+    uint page_offset = uint(get_dict_double(req, "page_offset", 0));
+    uint limit       = uint(get_dict_double(req, "limit", 500));
+    if (limit == 0 || limit > 5000) limit = 500;
+
     array<dictionary@> output;
+    uint matched = 0; // count of regions that passed filters
     for (uint i = 0; i < vads.length(); i++)
     {
         if (vads[i] is null) continue;
@@ -904,6 +945,11 @@ void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
         if (min_size > 0 && u_size < min_size) continue;
         if (filter_addr && (u_start + u_size <= addr_start || u_start >= addr_end)) continue;
 
+        // Passed all filters — apply pagination window.
+        if (matched < page_offset) { matched++; continue; }
+        if (output.length() >= limit) { matched++; continue; }
+        matched++;
+
         dictionary entry;
         entry.set("start", to_hex(u_start));
         entry.set("size",  to_hex(u_size));
@@ -916,13 +962,18 @@ void cmd_get_vad_snapshot(dictionary &in req, dictionary &inout res)
         output.insertLast(@entry);
     }
     res.set("regions", @output);
-    res.set("count", double(output.length()));
+    res.set("returned", double(output.length()));
+    res.set("total_matched", double(matched));
+    res.set("page_offset", double(page_offset));
+    if (matched > page_offset + output.length()) res.set("has_more", true);
 }
 
 void cmd_alloc_vm(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
-    uint size = uint(get_dict_double(req, "size"));
+    double sz_d = get_dict_double(req, "size");
+    if (sz_d < 1 || sz_d > 268435456.0) { res.set("error", "size must be 1..256MB"); return; }
+    uint size = uint(sz_d);
     uint64 addr = g_proc.alloc_vm(size);
     if (addr != 0)
         res.set("address", to_hex(addr));
@@ -1017,8 +1068,8 @@ void cmd_scan_value(dictionary &in req, dictionary &inout res)
     if (results is null) { res.set("error", "scan returned null"); return; }
 
     uint page_offset = uint(get_dict_double(req, "page_offset", 0));
-    uint page_limit  = uint(get_dict_double(req, "page_limit",  1000));
-    if (page_limit == 0 || page_limit > 5000) page_limit = 1000;
+    uint page_limit  = uint(get_dict_double(req, "page_limit",  100));
+    if (page_limit == 0 || page_limit > 5000) page_limit = 100;
 
     array<string> hex_results;
     uint from = page_offset < results.length() ? page_offset : results.length();
@@ -1055,7 +1106,9 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
     array<uint64>@ ptr_refs = g_proc.scan_pointer(target, false);
     if (ptr_refs !is null)
     {
-        for (uint i = 0; i < ptr_refs.length() && i < 500; i++)
+        // Cap on in-region matches collected, not on raw scan index — otherwise
+        // valid refs past the first 500 (but inside the region) get dropped.
+        for (uint i = 0; i < ptr_refs.length() && abs_xrefs.length() < 500; i++)
         {
             if (ptr_refs[i] >= start && ptr_refs[i] < start + size)
                 abs_xrefs.insertLast(to_hex(ptr_refs[i]));
@@ -1080,8 +1133,11 @@ void cmd_find_xrefs(dictionary &in req, dictionary &inout res)
             uint64 resolved = uint64(int64(ref_addr) + int64(rel));
             if (resolved == target)
             {
-                // Found a relative reference, back up to find the instruction
-                rel_xrefs.insertLast(to_hex(start + off + i - 1)); // likely instruction start is 1 byte before
+                // Heuristic: instruction start is typically 1 byte before the rel32 (opcode).
+                // Guard the underflow when we're at the very start of the region.
+                uint64 rip_start = start + off + i;
+                if (rip_start > 0) rip_start -= 1;
+                rel_xrefs.insertLast(to_hex(rip_start));
             }
         }
     }
@@ -1098,8 +1154,10 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 vtable_addr = parse_hex(get_dict_string(req, "address"));
     uint max_entries = uint(get_dict_double(req, "max_entries", 50));
+    if (max_entries == 0 || max_entries > 512) max_entries = 50;
     bool disasm_preview = get_dict_bool(req, "disasm_preview");
 
+    array<string> funcs;
     array<dictionary@> entries;
     for (uint i = 0; i < max_entries; i++)
     {
@@ -1107,13 +1165,10 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
         if (func_ptr == 0) break;
         if (!g_proc.is_valid_address(func_ptr)) break;
 
-        dictionary entry;
-        entry.set("index", double(i));
-        entry.set("address", to_hex(vtable_addr + i * 8));
-        entry.set("function", to_hex(func_ptr));
-
         if (disasm_preview)
         {
+            dictionary entry;
+            entry.set("function", to_hex(func_ptr));
             array<uint8> code;
             g_proc.rvm(func_ptr, 64, code);
             if (code.length() > 0)
@@ -1133,11 +1188,17 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
                 }
                 entry.set("preview", preview);
             }
+            entries.insertLast(@entry);
         }
-        entries.insertLast(@entry);
+        else
+        {
+            funcs.insertLast(to_hex(func_ptr));
+        }
     }
-    res.set("entries", @entries);
-    res.set("count", double(entries.length()));
+    res.set("base", to_hex(vtable_addr));
+    if (disasm_preview) res.set("entries", @entries);
+    else                res.set("functions", funcs);
+    res.set("count", double(disasm_preview ? entries.length() : funcs.length()));
 }
 
 // ─── Advanced RE: RTTI ───────────────────────────────────────────────
@@ -1145,10 +1206,10 @@ void cmd_analyze_vtable(dictionary &in req, dictionary &inout res)
 void cmd_read_rtti(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
-    uint64 vtable_addr = parse_hex(get_dict_string(req, "vtable_address"));
+    uint64 obj_addr = parse_hex(get_dict_string(req, "object_address"));
 
-    // Read vtable pointer from object
-    uint64 vtable = g_proc.ru64(vtable_addr);
+    // First qword of the object is its vtable pointer.
+    uint64 vtable = g_proc.ru64(obj_addr);
     if (vtable == 0 || !g_proc.is_valid_address(vtable))
     {
         res.set("error", "invalid vtable pointer");
@@ -1214,6 +1275,17 @@ void cmd_read_rtti(dictionary &in req, dictionary &inout res)
 
 // ─── Advanced RE: Signature Generation ───────────────────────────────
 
+// Wildcard up to the last 4 bytes of an instruction (disp/rel operand tail).
+// Guards the uint underflow when inst_len < 4 (short rel8/disp8 forms).
+void wildcard_trailing(array<bool> &inout wildcard, uint64 offset, uint inst_len)
+{
+    uint span = inst_len < 4 ? inst_len : 4;
+    uint b0 = inst_len - span;
+    for (uint b = b0; b < inst_len; b++)
+        if (offset + b < wildcard.length())
+            wildcard[offset + b] = true;
+}
+
 void cmd_generate_signature(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
@@ -1256,25 +1328,11 @@ void cmd_generate_signature(dictionary &in req, dictionary &inout res)
 
                 bool has_disp;
                 if (operands[j].get("mem_has_displacement", has_disp) && has_disp)
-                {
-                    // Wildcard the last 4 bytes of the instruction (displacement)
-                    for (uint b = uint(inst_len) - 4; b < uint(inst_len); b++)
-                    {
-                        if (offset + b < wildcard.length())
-                            wildcard[offset + b] = true;
-                    }
-                }
+                    wildcard_trailing(wildcard, offset, uint(inst_len));
 
                 bool is_relative;
                 if (operands[j].get("imm_is_relative", is_relative) && is_relative)
-                {
-                    // Wildcard immediate relative bytes
-                    for (uint b = uint(inst_len) - 4; b < uint(inst_len); b++)
-                    {
-                        if (offset + b < wildcard.length())
-                            wildcard[offset + b] = true;
-                    }
-                }
+                    wildcard_trailing(wildcard, offset, uint(inst_len));
             }
         }
     }
@@ -1299,6 +1357,7 @@ void cmd_generate_signature(dictionary &in req, dictionary &inout res)
     res.set("signature", sig);
     res.set("address", to_hex(addr));
     res.set("length", double(code.length()));
+    res.set("note", "heuristic: wildcards operand tail bytes; verify uniqueness with pattern_all");
 }
 
 // ─── Advanced RE: Function Bounds ────────────────────────────────────
@@ -1416,7 +1475,6 @@ void cmd_analyze_function(dictionary &in req, dictionary &inout res)
         dictionary inst;
         inst.set("address", to_hex(uint64(rt_addr)));
         inst.set("text", text);
-        inst.set("mnemonic", mnemonic);
 
         // Track calls and jumps
         if (mnemonic == "call" || mnemonic == "CALL")
@@ -1503,24 +1561,37 @@ void cmd_diff_memory(dictionary &in req, dictionary &inout res)
     util_hex_decode(hex_b, raw_b, err);
 
     uint min_len = raw_a.length() < raw_b.length() ? raw_a.length() : raw_b.length();
+    bool with_values = get_dict_bool(req, "values");
 
+    array<string> offs;
     array<dictionary@> diffs;
+    uint hit = 0;
     for (uint i = 0; i < min_len; i++)
     {
         if (uint8(raw_a[i]) != uint8(raw_b[i]))
         {
-            dictionary d;
-            d.set("offset", to_hex(i));
-            d.set("a", double(uint8(raw_a[i])));
-            d.set("b", double(uint8(raw_b[i])));
-            diffs.insertLast(@d);
-            if (diffs.length() >= 1000) break;
+            if (with_values)
+            {
+                dictionary d;
+                d.set("offset", to_hex(i));
+                d.set("a", double(uint8(raw_a[i])));
+                d.set("b", double(uint8(raw_b[i])));
+                diffs.insertLast(@d);
+            }
+            else
+            {
+                offs.insertLast(to_hex(i));
+            }
+            if (++hit >= 1000) break;
         }
     }
 
-    res.set("differences", @diffs);
-    res.set("diff_count", double(diffs.length()));
+    if (with_values) res.set("differences", @diffs);
+    else             res.set("offsets", offs);
+    res.set("diff_count", double(hit));
+    res.set("returned", double(hit));
     res.set("compared_bytes", double(min_len));
+    if (hit >= 1000) res.set("truncated", true);
     if (raw_a.length() != raw_b.length())
         res.set("size_mismatch", true);
 }
@@ -1533,8 +1604,8 @@ void cmd_scan_pointer_to(dictionary &in req, dictionary &inout res)
     uint64 target    = parse_hex(get_dict_string(req, "target"));
     bool   heap_only = get_dict_bool(req, "heap_only");
     uint   page_offset = uint(get_dict_double(req, "page_offset", 0));
-    uint   page_limit  = uint(get_dict_double(req, "page_limit",  1000));
-    if (page_limit == 0 || page_limit > 5000) page_limit = 1000;
+    uint   page_limit  = uint(get_dict_double(req, "page_limit",  100));
+    if (page_limit == 0 || page_limit > 5000) page_limit = 100;
     if (target == 0) { res.set("error", "invalid target address (got 0)"); return; }
 
     array<uint64>@ results = g_proc.scan_pointer(target, heap_only);
@@ -1563,6 +1634,13 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
     string search = get_dict_string(req, "search_text");
     if (search.length() == 0) { res.set("error", "search_text is empty"); return; }
 
+    uint max_strings = uint(get_dict_double(req, "max_strings", 20));
+    uint max_refs    = uint(get_dict_double(req, "max_refs_per_string", 50));
+    uint max_total   = uint(get_dict_double(req, "max_total_refs", 500));
+    if (max_strings == 0 || max_strings > 100) max_strings = 20;
+    if (max_refs == 0 || max_refs > 200) max_refs = 50;
+    if (max_total == 0 || max_total > 2000) max_total = 500;
+
     // First find the strings in memory
     array<uint64>@ string_addrs = g_proc.scan_string(search, false);
     array<uint64>@ wstring_addrs = g_proc.scan_wstring(search, false);
@@ -1572,12 +1650,12 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
     // For each found string, look for pointers to it
     if (string_addrs !is null)
     {
-        for (uint i = 0; i < string_addrs.length() && i < 20; i++)
+        for (uint i = 0; i < string_addrs.length() && i < max_strings && refs.length() < max_total; i++)
         {
             array<uint64>@ ptrs = g_proc.scan_pointer(string_addrs[i], false);
             if (ptrs !is null)
             {
-                for (uint j = 0; j < ptrs.length() && j < 50; j++)
+                for (uint j = 0; j < ptrs.length() && j < max_refs && refs.length() < max_total; j++)
                 {
                     dictionary r;
                     r.set("string_address", to_hex(string_addrs[i]));
@@ -1591,12 +1669,12 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 
     if (wstring_addrs !is null)
     {
-        for (uint i = 0; i < wstring_addrs.length() && i < 20; i++)
+        for (uint i = 0; i < wstring_addrs.length() && i < max_strings && refs.length() < max_total; i++)
         {
             array<uint64>@ ptrs = g_proc.scan_pointer(wstring_addrs[i], false);
             if (ptrs !is null)
             {
-                for (uint j = 0; j < ptrs.length() && j < 50; j++)
+                for (uint j = 0; j < ptrs.length() && j < max_refs && refs.length() < max_total; j++)
                 {
                     dictionary r;
                     r.set("string_address", to_hex(wstring_addrs[i]));
@@ -1610,6 +1688,7 @@ void cmd_find_string_refs(dictionary &in req, dictionary &inout res)
 
     res.set("references", @refs);
     res.set("count", double(refs.length()));
+    if (refs.length() >= max_total) res.set("truncated", true);
 }
 
 // ─── Unicorn Emulation ──────────────────────────────────────────────
@@ -1622,6 +1701,8 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     uint code_size = uint(get_dict_double(req, "code_size"));
     uint entry_offset = uint(get_dict_double(req, "entry_offset", 0));
     uint max_insts = uint(get_dict_double(req, "max_instructions", 10000));
+    if (code_size == 0 || code_size > 0x100000) { res.set("error", "code_size must be 1..1MB"); return; }
+    if (max_insts == 0 || max_insts > 1000000) max_insts = 10000;
 
     // Read code from target
     array<uint8> code;
@@ -1651,15 +1732,23 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     uc_mem_map(uc, stop_addr & ~0xFFF, 0x1000, UC_PROT_ALL);
     uc_setup_stack(uc, stack_base, stack_size, stop_addr);
 
-    // Map additional regions if requested
+    // Map additional regions if requested — capped: 32 regions, 16MB each, 64MB total.
     array<dictionary@>@ map_regions;
     if (req.get("map_regions", @map_regions) && map_regions !is null)
     {
-        for (uint i = 0; i < map_regions.length(); i++)
+        uint64 total_mapped = 0;
+        uint max_regions = 32;
+        uint max_region_sz = 16 * 1024 * 1024;
+        uint64 max_total = 64 * 1024 * 1024;
+        uint n = map_regions.length();
+        if (n > max_regions) n = max_regions;
+        for (uint i = 0; i < n; i++)
         {
             if (map_regions[i] is null) continue;
             uint64 r_addr = parse_hex(get_dict_string(map_regions[i], "address"));
             uint r_size = uint(get_dict_double(map_regions[i], "size"));
+            if (r_size == 0 || r_size > max_region_sz) continue;
+            if (total_mapped + r_size > max_total) break;
             uint64 aligned_addr = r_addr & ~0xFFF;
             uint64 aligned_size = ((r_size + (r_addr - aligned_addr) + 0xFFF) & ~0xFFF);
 
@@ -1669,6 +1758,7 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
             {
                 uc_mem_map(uc, aligned_addr, aligned_size, UC_PROT_ALL);
                 uc_mem_write(uc, r_addr, region_data);
+                total_mapped += r_size;
             }
         }
     }
@@ -1684,24 +1774,7 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
             string rv;
             if (!regs.get(rn, rv)) continue;
             uint64 val = parse_hex(rv);
-
-            int reg_id = -1;
-            if (rn == "rax" || rn == "RAX") reg_id = UC_X86_REG_RAX;
-            else if (rn == "rbx" || rn == "RBX") reg_id = UC_X86_REG_RBX;
-            else if (rn == "rcx" || rn == "RCX") reg_id = UC_X86_REG_RCX;
-            else if (rn == "rdx" || rn == "RDX") reg_id = UC_X86_REG_RDX;
-            else if (rn == "rsi" || rn == "RSI") reg_id = UC_X86_REG_RSI;
-            else if (rn == "rdi" || rn == "RDI") reg_id = UC_X86_REG_RDI;
-            else if (rn == "r8"  || rn == "R8")  reg_id = UC_X86_REG_R8;
-            else if (rn == "r9"  || rn == "R9")  reg_id = UC_X86_REG_R9;
-            else if (rn == "r10" || rn == "R10") reg_id = UC_X86_REG_R10;
-            else if (rn == "r11" || rn == "R11") reg_id = UC_X86_REG_R11;
-            else if (rn == "r12" || rn == "R12") reg_id = UC_X86_REG_R12;
-            else if (rn == "r13" || rn == "R13") reg_id = UC_X86_REG_R13;
-            else if (rn == "r14" || rn == "R14") reg_id = UC_X86_REG_R14;
-            else if (rn == "r15" || rn == "R15") reg_id = UC_X86_REG_R15;
-            else if (rn == "rbp" || rn == "RBP") reg_id = UC_X86_REG_RBP;
-
+            int reg_id = reg_name_to_id(rn);
             if (reg_id >= 0)
                 uc_reg_write64(uc, reg_id, val);
         }
@@ -1713,20 +1786,20 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
 
     res.set("emu_result", double(emu_result));
 
-    // Read output registers
-    array<string> read_regs;
-    array<dictionary@>@ read_regs_raw;
-    // Default: read rax
+    // Read only requested output registers (default rax) — saves tokens vs fixed dump.
+    string rr_csv = get_dict_string(req, "read_registers_csv", "rax");
+    if (rr_csv == "") rr_csv = "rax";
+    array<string> want = str_split(rr_csv, ",");
     dictionary reg_out;
-    reg_out.set("rax", to_hex(uc_reg_read64(uc, UC_X86_REG_RAX)));
-    reg_out.set("rbx", to_hex(uc_reg_read64(uc, UC_X86_REG_RBX)));
-    reg_out.set("rcx", to_hex(uc_reg_read64(uc, UC_X86_REG_RCX)));
-    reg_out.set("rdx", to_hex(uc_reg_read64(uc, UC_X86_REG_RDX)));
-    reg_out.set("rsi", to_hex(uc_reg_read64(uc, UC_X86_REG_RSI)));
-    reg_out.set("rdi", to_hex(uc_reg_read64(uc, UC_X86_REG_RDI)));
-    reg_out.set("r8",  to_hex(uc_reg_read64(uc, UC_X86_REG_R8)));
-    reg_out.set("r9",  to_hex(uc_reg_read64(uc, UC_X86_REG_R9)));
-    reg_out.set("rip", to_hex(uc_reg_read64(uc, UC_X86_REG_RIP)));
+    for (uint i = 0; i < want.length(); i++)
+    {
+        string rn = want[i];
+        while (rn.length() > 0 && rn[0] == 32) rn = rn.substr(1);
+        int id = reg_name_to_id(rn);
+        if (id >= 0) reg_out.set(rn, to_hex(uc_reg_read64(uc, id)));
+    }
+    if (reg_out.getKeys().length() == 0)
+        reg_out.set("rax", to_hex(uc_reg_read64(uc, UC_X86_REG_RAX)));
     res.set("registers", @reg_out);
 
     if (emu_result != 0)
@@ -1738,15 +1811,6 @@ void cmd_emulate_code(dictionary &in req, dictionary &inout res)
     uc_close(uc);
 }
 
-// ─── Assemble ────────────────────────────────────────────────────────
-
-void cmd_assemble(dictionary &in req, dictionary &inout res)
-{
-    // This is a simplified assembler - for complex assembly, use the Zydis encoder API
-    // For now, support common instructions
-    res.set("error", "use write_memory with pre-assembled hex bytes, or emulate_code for execution");
-}
-
 // ─── Hex Dump ────────────────────────────────────────────────────────
 
 void cmd_hex_dump(dictionary &in req, dictionary &inout res)
@@ -1754,7 +1818,8 @@ void cmd_hex_dump(dictionary &in req, dictionary &inout res)
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
     uint64 addr = parse_hex(get_dict_string(req, "address"));
     uint size = uint(get_dict_double(req, "size", 256));
-    if (size > 4096) size = 4096;
+    if (size == 0) size = 256;
+    if (size > 4096) { res.set("error", "size > 4096 (max 4096)"); return; }
 
     array<uint8> data;
     g_proc.rvm(addr, size, data);
@@ -1821,27 +1886,37 @@ void cmd_cs2_get_interface(dictionary &in req, dictionary &inout res)
         res.set("error", "interface not found");
 }
 
-void cmd_cs2_schema_dump(dictionary &inout res)
+void cmd_cs2_schema_dump(dictionary &in req, dictionary &inout res)
 {
     if (!g_attached || !g_proc.alive()) { res.set("error", "not attached"); return; }
+    string filter = get_dict_string(req, "filter", "");
+    bool all = get_dict_bool(req, "all");
+    uint limit = uint(get_dict_double(req, "limit", 100));
+    if (filter == "" && !all) { res.set("error", "filter required (substring on field name), or pass all:true"); return; }
+    if (limit == 0) limit = 100;
+    if (limit > 2000) limit = 2000;
+
     array<dictionary@>@ schema = g_proc.cs2_get_schema_dump();
     if (schema is null) { res.set("error", "schema dump failed"); return; }
+    uint total = 0;
 
-    array<dictionary@> output;
+    array<string> output;
     for (uint i = 0; i < schema.length(); i++)
     {
         if (schema[i] is null) continue;
-        dictionary entry;
         string name;
         int64 offset;
         schema[i].get("name", name);
         schema[i].get("offset", offset);
-        entry.set("name", name);
-        entry.set("offset", to_hex(uint64(offset)));
-        output.insertLast(@entry);
+        if (filter != "" && name.findFirst(filter) < 0) continue;
+        total++;
+        if (limit != 0 && output.length() >= limit) continue;
+        output.insertLast(name + ":" + to_hex(uint64(offset)));
     }
-    res.set("schema", @output);
+    res.set("schema", output);
     res.set("count", double(output.length()));
+    res.set("total_matched", double(total));
+    if (limit != 0 && total > output.length()) res.set("has_more", true);
 }
 
 // ─── Scan Heap Regions ───────────────────────────────────────────────
@@ -1857,7 +1932,8 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     string regions_csv  = get_dict_string(req, "regions_csv");
     string type         = get_dict_string(req, "type", "u64");
     uint   max_results  = uint(get_dict_double(req, "max_results", 100));
-    if (max_results == 0 || max_results > 5000) max_results = 100;
+    if (max_results == 0) max_results = 100;
+    if (max_results > 5000) max_results = 5000;
 
     if (regions_csv == "") { res.set("error", "missing regions_csv"); return; }
 
@@ -1866,6 +1942,18 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     if (!is_u64 && !is_u32) { res.set("error", "type must be u32/u64/pointer"); return; }
 
     uint   val_size = is_u64 ? 8 : 4;
+
+    // Alignment: caller-supplied stride, 1|2|4|8. Default = val_size (fast, aligned only).
+    // alignment:1 hits unaligned values but is 4-8x slower.
+    uint   alignment = uint(get_dict_double(req, "alignment", double(val_size)));
+    if (alignment == 0 || (alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8))
+        alignment = val_size;
+
+    // Safety budget so a bad regions list can't scan forever. Default 4GB total,
+    // configurable via max_total_bytes (max 16GB).
+    uint64 max_total = uint64(get_dict_double(req, "max_total_bytes", 4294967296.0)); // 4 GiB
+    if (max_total == 0 || max_total > 17179869184.0) max_total = 4294967296.0;
+
     uint64 u64_val  = 0;
     uint   u32_val  = 0;
     if (is_u64)
@@ -1882,49 +1970,70 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     array<string> found;
     uint total_regions = 0;
     uint64 total_bytes = 0;
+    bool budget_hit = false;
 
-    for (uint ri = 0; ri < region_pairs.length() && found.length() < max_results; ri++)
+    // Chunk size chosen so scan_end fits in uint (32-bit) headroom.
+    uint64 chunk = 16 * 1024 * 1024;
+    // Advance = (chunk - overlap) rounded DOWN to a multiple of 8. Rationale:
+    //   1. overlap of (val_size-1) alone catches values straddling the boundary,
+    //   2. but if `advance` isn't a multiple of `alignment`, the next chunk's
+    //      buffer-local grid gets shifted and aligned matches inside it are
+    //      missed. Rounding to 8 covers alignment ∈ {1,2,4,8} and val_size ∈ {4,8}.
+    uint64 advance = (chunk - uint64(val_size - 1)) & ~uint64(7);
+
+    for (uint ri = 0; ri < region_pairs.length() && found.length() < max_results && !budget_hit; ri++)
     {
         array<string> parts = str_split(region_pairs[ri], ":");
         if (parts.length() < 2) continue;
         uint64 r_start = parse_hex(parts[0]);
         uint64 r_size  = parse_hex(parts[1]);
-        if (r_start == 0 || r_size == 0 || r_size > 64 * 1024 * 1024) continue;
+        if (r_start == 0 || r_size == 0) continue;
 
-        // Read the region (cap per-region read at 16 MB to avoid stalls)
-        uint read_sz = uint(r_size < 16 * 1024 * 1024 ? r_size : 16 * 1024 * 1024);
-        array<uint8> data;
-        g_proc.rvm(r_start, read_sz, data);
-        if (data.length() < val_size) continue;
         total_regions++;
-        total_bytes += data.length();
 
-        // Scan aligned at val_size steps — enough for vtable/pointer/u64 scans
-        uint scan_end = data.length() - (val_size - 1);
-        for (uint i = 0; i < scan_end && found.length() < max_results; i += val_size)
+        uint64 base_off = 0;
+        while (base_off < r_size && found.length() < max_results)
         {
-            if (is_u64)
+            if (total_bytes >= max_total) { budget_hit = true; break; }
+
+            uint64 remain = r_size - base_off;
+            uint read_sz = uint(remain < chunk ? remain : chunk);
+            array<uint8> data;
+            g_proc.rvm(r_start + base_off, read_sz, data);
+            if (data.length() < val_size) break; // partial page / read failure — bail this region
+
+            total_bytes += data.length();
+
+            uint scan_end = data.length() - (val_size - 1);
+            for (uint i = 0; i < scan_end && found.length() < max_results; i += alignment)
             {
-                uint64 v =  uint64(data[i])
-                         | (uint64(data[i+1]) << 8)
-                         | (uint64(data[i+2]) << 16)
-                         | (uint64(data[i+3]) << 24)
-                         | (uint64(data[i+4]) << 32)
-                         | (uint64(data[i+5]) << 40)
-                         | (uint64(data[i+6]) << 48)
-                         | (uint64(data[i+7]) << 56);
-                if (v == u64_val)
-                    found.insertLast(to_hex(r_start + i));
+                if (is_u64)
+                {
+                    uint64 v =  uint64(data[i])
+                             | (uint64(data[i+1]) << 8)
+                             | (uint64(data[i+2]) << 16)
+                             | (uint64(data[i+3]) << 24)
+                             | (uint64(data[i+4]) << 32)
+                             | (uint64(data[i+5]) << 40)
+                             | (uint64(data[i+6]) << 48)
+                             | (uint64(data[i+7]) << 56);
+                    if (v == u64_val)
+                        found.insertLast(to_hex(r_start + base_off + i));
+                }
+                else
+                {
+                    uint v =  uint(data[i])
+                           | (uint(data[i+1]) << 8)
+                           | (uint(data[i+2]) << 16)
+                           | (uint(data[i+3]) << 24);
+                    if (v == u32_val)
+                        found.insertLast(to_hex(r_start + base_off + i));
+                }
             }
-            else
-            {
-                uint v =  uint(data[i])
-                       | (uint(data[i+1]) << 8)
-                       | (uint(data[i+2]) << 16)
-                       | (uint(data[i+3]) << 24);
-                if (v == u32_val)
-                    found.insertLast(to_hex(r_start + i));
-            }
+
+            // Last chunk of this region — nothing left to overlap into.
+            if (uint64(read_sz) == remain) break;
+            base_off += advance;
         }
     }
 
@@ -1932,6 +2041,11 @@ void cmd_scan_heap_regions(dictionary &in req, dictionary &inout res)
     res.set("count",           double(found.length()));
     res.set("regions_scanned", double(total_regions));
     res.set("bytes_scanned",   double(total_bytes));
+    res.set("alignment",       double(alignment));
+    if (budget_hit) {
+        res.set("budget_exceeded", true);
+        res.set("max_total_bytes", double(max_total));
+    }
     if (found.length() >= max_results)
         res.set("truncated", true);
 }
@@ -1949,9 +2063,11 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
     uint   count        = uint(get_dict_double(req, "count", 64));
     uint   stride       = uint(get_dict_double(req, "stride", 8));
     uint64 vtable_check = parse_hex(get_dict_string(req, "vtable_check_addr"));
-    uint   deref_offset = uint(get_dict_double(req, "deref_offset", 0));
+    // deref_offset is signed — negative values subtract from ptr.
+    int64  deref_offset = int64(get_dict_double(req, "deref_offset", 0));
 
-    if (count == 0 || count > 2048) count = 64;
+    if (count == 0) { res.set("error", "count must be >= 1"); return; }
+    if (count > 2048) { res.set("error", "count > 2048 (max 2048)"); return; }
     if (stride == 0) stride = 8;
 
     array<dictionary@> matches;
@@ -1962,7 +2078,8 @@ void cmd_read_and_filter_pointers(dictionary &in req, dictionary &inout res)
         uint64 ptr      = g_proc.ru64(ptr_addr);
         if (ptr == 0) continue;
 
-        uint64 check_val = g_proc.ru64(ptr + deref_offset);
+        uint64 check_addr = uint64(int64(ptr) + deref_offset);
+        uint64 check_val  = g_proc.ru64(check_addr);
         if (check_val != vtable_check) continue;
 
         dictionary m;
@@ -2030,10 +2147,9 @@ void handle_request(dictionary &in req)
     else if (cmd == "read_and_filter_pointers") cmd_read_and_filter_pointers(req, res);
     else if (cmd == "find_string_refs")    cmd_find_string_refs(req, res);
     else if (cmd == "emulate_code")        cmd_emulate_code(req, res);
-    else if (cmd == "assemble")            cmd_assemble(req, res);
     else if (cmd == "hex_dump")            cmd_hex_dump(req, res);
     else if (cmd == "cs2_get_interface")   cmd_cs2_get_interface(req, res);
-    else if (cmd == "cs2_schema_dump")     cmd_cs2_schema_dump(res);
+    else if (cmd == "cs2_schema_dump")     cmd_cs2_schema_dump(req, res);
     else
         res.set("error", "unknown command: " + cmd);
 
@@ -2077,15 +2193,20 @@ void ws_pump()
     {
         if (is_text)
         {
-            // Swallow hub pings ({"_hub_ping":true}) — no response needed
-            if (msg.findFirst("_hub_ping") >= 0) { g_idle_ticks = 0; break; }
-
             dictionary req;
             string err;
-            if (json_parse(msg, req, err))
-                handle_request(req);
-            else
+            if (!json_parse(msg, req, err))
+            {
                 log_error("JSON parse error: " + err);
+                continue;
+            }
+
+            // Swallow hub pings (structured check, not substring — a real request
+            // whose string arg happens to contain "_hub_ping" would otherwise be dropped)
+            bool hub_ping;
+            if (req.get("_hub_ping", hub_ping) && hub_ping) { g_idle_ticks = 0; continue; }
+
+            handle_request(req);
             g_idle_ticks = 0;
         }
         if (is_closed) break;
