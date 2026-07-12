@@ -150,16 +150,16 @@ This fork also fixes real bugs and hardens the bridge:
 - **Perception AngelScript hello is accepted without a token** — the AS runtime here has no file I/O primitives exposed, so requiring a token file would break attachment. Loopback bind is the primary defense on that path; a local process running as the same user can still impersonate. Delete the token file to rotate.
 - **Handshake timeout is 2 seconds.** Sockets that don't identify with either `_mcp_relay` or `_mcp_perception`/`_perception_hello` are dropped.
 
-## Known limitations (not yet addressed)
+## Known limitations
 
-Static review flagged these; they need in-Perception runtime testing before changing, so they're documented rather than blindly patched:
+Runtime-verified against a live target — these are inherent to the current design, documented rather than silently patched:
 
 - **Node request timeouts are caller-side only.** A 120s timeout rejects the pending MCP request, but the AngelScript scan loop (`scan_value`, `pattern_scan_all`, `find_xrefs`, `find_string_refs`, `cs2_schema_dump`) does not check a deadline and keeps running until it finishes. Cooperative cancellation would need to be added inside those loops.
 - **`re_diff emulate` maps code at a fixed base (0x10000), not the original VA.** RIP-relative operands resolve against that base, so snippets that reference absolute module data may emulate inaccurately. Map the needed data via `map_regions`, or treat results as position-independent only.
 - **`re_scan pattern`/`xrefs` scan cost isn't bounded by `max_results`/pagination** — those cap returned results, not work done. Absolute-xref scanning is process-wide, then filtered to the region. Pass `module_name` or `start`+`size` to bound it.
 - **`xrefs` relative-ref detection is heuristic** (rel32 pattern match, instruction start guessed as one byte prior). It can misreport; verify hits by disassembling around them.
 - **`gensig` wildcarding is heuristic** (operand-tail bytes). Confirm uniqueness with `pattern_all`.
-- **`scan heap_regions`** now chunks every region regardless of size (16MB windows, 8-byte overlap so alignment-8 values straddling a chunk are still caught). A total-bytes budget (default 4GB, max 16GB via `max_total_bytes`) prevents runaway scans; if hit, `budget_exceeded:true` and results are partial. Pass `alignment:1` to catch unaligned values (4-8x slower).
+- **`scan heap_regions`** chunks every region regardless of size (16MB windows, 8-byte overlap so alignment-8 values straddling a chunk are still caught). A total-bytes budget (default 4GB, max 16GB via `max_total_bytes`) prevents runaway scans; if hit, `budget_exceeded:true` and results are partial. Pass `alignment:1` to catch unaligned values (4-8x slower). Requires a current `re_server.as` — see the stale-script note below.
 
 **MCP not showing in Claude Code** - verify the absolute path to `dist/index.js` in `~/.mcp.json`, restart Claude Code, run `npm run build` if `dist/` is missing.
 
@@ -170,6 +170,8 @@ Static review flagged these; they need in-Perception runtime testing before chan
 **Port 9001 in use** - the hub can't bind if something else holds the port; free it or kill the stale process.
 
 **Perception disconnected** - the AngelScript server auto-reconnects; if Perception itself closed, reopen and reload `re_server.as`.
+
+**Recently-added AS features do nothing (e.g. `heap_regions` `max_total_bytes` budget / `alignment`)** - the `re_server.as` loaded in Perception is older than this repo. Perception does **not** hot-reload file edits: overwrite the copy you load (commonly `Documents/My Games/extensions/re_server.as`) with this repo's `re_server.as`, then stop and re-run the script. Tell: a current build echoes an `alignment` field in `heap_regions` responses; an old one omits it and ignores `max_total_bytes`.
 
 ## Project Structure
 
