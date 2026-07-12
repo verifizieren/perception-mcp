@@ -47,6 +47,34 @@ function loadOrCreateToken(): string {
 }
 const AUTH_TOKEN = loadOrCreateToken();
 
+// ─── Session store (local findings scratchpad, survives restarts) ────
+// A tiny JSON file of confirmed findings so a task reads prior results
+// instead of re-deriving them. One file shared across hub + relay
+// instances; last-writer-wins.
+// ponytail: last-writer-wins is fine for single-operator RE — add file
+// locking only if concurrent instances start clobbering each other.
+const SESSION_PATH = path.join(os.tmpdir(), `perception-mcp-session-${os.userInfo().username}.json`);
+type Session = {
+  target: string | null;
+  offsets: Record<string, { value: string; module?: string; notes?: string }>;
+  signatures: Record<string, { pattern: string; result?: string }>;
+  structs: Record<string, any>;
+  notes: string[];
+  updated: string;
+};
+function emptySession(): Session {
+  return { target: null, offsets: {}, signatures: {}, structs: {}, notes: [], updated: "" };
+}
+function loadSession(): Session {
+  try { return { ...emptySession(), ...JSON.parse(fs.readFileSync(SESSION_PATH, "utf8")) }; }
+  catch { return emptySession(); }
+}
+function saveSession(s: Session): Session {
+  s.updated = new Date().toISOString();
+  fs.writeFileSync(SESSION_PATH, JSON.stringify(s), { mode: 0o600 });
+  return s;
+}
+
 let pendingRequests = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> | undefined }>();
 let requestId = 0;
 let instanceId = `mcp_${process.pid}_${Date.now()}`;
@@ -358,7 +386,7 @@ async function callTool(cmd: string, params: Record<string, any> = {}, timeoutMs
 // ─── MCP Server ──────────────────────────────────────────────────────
 const server = new McpServer({
   name: "perception-re",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 
@@ -439,21 +467,39 @@ async function dispatch(table: Record<string, OpSpec>, op: string, p: any) {
   return { content: [{ type: "text" as const, text: res }] };
 }
 
+const tr = (o: any) => ({ content: [{ type: "text" as const, text: typeof o === "string" ? o : JSON.stringify(o) }] });
+
+// Answered from local bridge state — no round-trip to Perception, so it
+// works even when Perception is NOT connected (that's the whole point).
+function connectionStatus() {
+  if (isHub) {
+    const connected = !!(percClient && percClient.readyState === WebSocket.OPEN);
+    return tr({ role: "hub", perception_connected: connected, relays: relayClients.size,
+                hint: connected ? undefined : "Load re_server.as in Perception and run it." });
+  }
+  const hub = !!(hubConnection && hubConnection.readyState === WebSocket.OPEN);
+  return tr({ role: "relay", hub_connected: hub, perception_connected: hub ? "unknown" : false,
+              hint: "Perception state is hub-authoritative; a tool call returns 'Perception not connected' if it's down." });
+}
+
 // ── re_proc: process lifecycle ───────────────────────────────────────
 server.tool(
   "re_proc",
-  "Process lifecycle & validation. ops: attach {name?|pid?}, detach {}, info {}, is_valid {address}, tebs {}",
-  { op: z.enum(["attach","detach","info","is_valid","tebs"]).describe("Operation"),
+  "Process lifecycle & validation. ops: status {} (is Perception connected — call FIRST, no attach needed), attach {name?|pid?}, detach {}, info {}, is_valid {address}, tebs {}",
+  { op: z.enum(["status","attach","detach","info","is_valid","tebs"]).describe("Operation"),
     name:    z.string().optional().describe("attach: process name e.g. 'notepad.exe'"),
     pid:     z.number().int().positive().optional().describe("attach: process id"),
     address: z.string().optional().describe("is_valid: hex address") },
-  async (p) => dispatch({
+  async (p) => {
+    if (p.op === "status") return connectionStatus();
+    return dispatch({
     attach:   { cmd: "attach",           build: x => ({ name: x.name, pid: x.pid }) },
     detach:   { cmd: "detach",           build: () => ({}) },
     info:     { cmd: "process_info",     build: () => ({}) },
     is_valid: { cmd: "is_valid_address", required: ["address"], hex: ["address"], build: x => ({ address: x.address }) },
     tebs:     { cmd: "get_tebs",         build: () => ({}) },
-  }, p.op, p)
+    }, p.op, p);
+  }
 );
 
 // ── re_read: typed / structured memory reads ─────────────────────────
@@ -677,6 +723,58 @@ server.tool(
                  } },
   }, p.op, p)
 );
+
+// ── re_session: persistent findings scratchpad ───────────────────────
+// Local JSON store (not a Perception round-trip). Read it at task start
+// so confirmed offsets/sigs/structs aren't re-derived every session.
+server.tool(
+  "re_session",
+  "Persistent findings scratchpad (survives restarts). Read with get BEFORE re-scanning. ops: get {}, save_offset {name,value,module?,notes?}, save_signature {name,pattern,result?}, save_struct {name,fields}, note {text}, clear {target?} (wipe for a new target).",
+  { op: z.enum(["get","save_offset","save_signature","save_struct","note","clear"]).describe("Operation"),
+    name:    z.string().optional().describe("save_*: finding name"),
+    value:   z.string().optional().describe("save_offset: value/expr e.g. 'client.dll+0x1a2b3c'"),
+    module:  z.string().optional().describe("save_offset: owning module"),
+    notes:   z.string().optional().describe("save_offset: context"),
+    pattern: z.string().optional().describe("save_signature: IDA-style pattern"),
+    result:  z.string().optional().describe("save_signature: resolved addr / module+offset"),
+    fields:  z.union([z.array(z.any()), z.string()]).optional().describe("save_struct: field array or JSON string"),
+    text:    z.string().optional().describe("note: freeform finding"),
+    target:  z.string().optional().describe("clear: optional label for the new target") },
+  async (p) => {
+    try {
+      const s = loadSession();
+      switch (p.op) {
+        case "get": return tr(s);
+        case "save_offset":
+          if (!p.name || !p.value) throw new Error("save_offset needs name and value");
+          s.offsets[p.name] = { value: p.value, module: p.module, notes: p.notes };
+          return tr(saveSession(s));
+        case "save_signature":
+          if (!p.name || !p.pattern) throw new Error("save_signature needs name and pattern");
+          s.signatures[p.name] = { pattern: p.pattern, result: p.result };
+          return tr(saveSession(s));
+        case "save_struct":
+          if (!p.name || p.fields === undefined) throw new Error("save_struct needs name and fields");
+          s.structs[p.name] = typeof p.fields === "string" ? JSON.parse(p.fields) : p.fields;
+          return tr(saveSession(s));
+        case "note":
+          if (!p.text) throw new Error("note needs text");
+          s.notes.push(p.text);
+          return tr(saveSession(s));
+        case "clear": {
+          const fresh = emptySession();
+          fresh.target = p.target ?? null;
+          return tr(saveSession(fresh));
+        }
+        default:
+          throw new Error(`unknown op "${p.op}"`);
+      }
+    } catch (e: any) {
+      return tr(`error: ${e.message}`);
+    }
+  }
+);
+
 // ── Start Server ─────────────────────────────────────────────────────
 
 async function main() {
