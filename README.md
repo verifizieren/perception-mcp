@@ -73,11 +73,12 @@ First instance = **hub** (WebSocket server on port 9001). Additional instances a
 
 ## Tools
 
-All functionality is exposed through **9 dispatchers**. Each takes an `op` selector plus the args for that op. This keeps the schema footprint small while covering every operation.
+All functionality is exposed through **10 dispatchers**. Each takes an `op` selector plus the args for that op. This keeps the schema footprint small while covering every operation.
 
 | Dispatcher | ops |
 |------------|-----|
-| `re_proc`   | `attach` {name?\|pid?}, `detach`, `info`, `is_valid` {address}, `tebs` |
+| `re_proc`   | `status` (Perception connected? — no attach needed), `attach` {name?\|pid?}, `detach`, `info`, `is_valid` {address}, `tebs` |
+| `re_session` | `get`, `save_offset` {name,value,module?,notes?}, `save_signature` {name,pattern,result?}, `save_struct` {name,fields}, `note` {text}, `clear` {target?} — local JSON scratchpad, survives restarts |
 | `re_read`   | `bytes` {address,size}, `values` {address,type,count?}, `string` {address,max_length?}, `wstring` {...}, `ptr_chain` {base,offsets[],final_type?,verbose?}, `struct` {address,fields[]}, `ptr_array` {address,count,offset_delta?}, `hex_dump` {address,size?}, `filter_ptrs` {base,count,vtable_check_addr,stride?,deref_offset?} |
 | `re_write`  | `bytes` {address,data}, `values` {address,type,values[]}, `string` {address,text}, `wstring` {address,text} |
 | `re_scan`   | `pattern` {signature,...}, `pattern_all` {signature,...,max_results?}, `value` {type,value,heap_only?,page_offset?,page_limit?}, `ptr_to` {target,...}, `heap_regions` {regions[],type,value,max_results?}, `xrefs` {target,...}, `string_refs` {search_text} |
@@ -91,6 +92,8 @@ All functionality is exposed through **9 dispatchers**. Each takes an `op` selec
 
 ### Notes on defaults
 
+- `re_proc status` reports connection state from the bridge itself (no round-trip to Perception), so it answers even when Perception is down — call it before attaching instead of guessing.
+- `re_session` persists confirmed offsets/sigs/structs/notes to `%TEMP%/perception-mcp-session-<user>.json`. Call `re_session get` at task start so prior findings are reused instead of re-scanned; `re_session clear` when switching target.
 - `re_vm vad` returns compact `{start,size}` by default - pass `compact:false` for protection/heap_likely metadata. Always filter (`min_size`, `heap_only`, `addr_*`) to avoid oversized responses.
 - `re_read ptr_chain` returns `final_address`/`final_value` only; pass `verbose:true` for the per-step trace. `u64`/`i64` final values come back as hex strings (JSON numbers can't hold 64 bits).
 - `re_read values`/`struct` return `u64`/`i64` as hex strings too; smaller ints as numbers.
